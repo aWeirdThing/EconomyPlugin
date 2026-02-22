@@ -1,3 +1,4 @@
 discord.py
 supabase
-python-dotenv
+fastapi
+uvicorn
