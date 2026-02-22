@@ -1,16 +1,23 @@
 import os
 import discord
 from discord import app_commands
-from supabase import create_client
 import uuid
+import requests
+from supabase import create_client
+from dotenv import load_dotenv
 
-# ================= CONFIG =================
+# ---------------- LOAD ENV ----------------
+load_dotenv()
 
+# Discord + Supabase
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # MUST BE sb_secret_ key
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Connect to Supabase
+# Optional API settings
+API_URL = os.getenv("API_URL")  # e.g., https://my-economy-api.up.railway.app
+API_KEY = os.getenv("API_KEY")  # optional secret key for API calls
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Discord setup
@@ -18,13 +25,15 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# ================= DATABASE FUNCTIONS =================
+# ---------------- DATABASE FUNCTIONS ----------------
 
 def get_user(discord_id):
+    """Get user info from Supabase"""
     res = supabase.table("users").select("*").eq("discord_id", str(discord_id)).execute()
     return res.data[0] if res.data else None
 
 def create_user(discord_id):
+    """Create new user in Supabase"""
     uid = str(uuid.uuid4())
     supabase.table("users").insert({
         "uuid": uid,
@@ -34,23 +43,54 @@ def create_user(discord_id):
     return uid
 
 def get_balance(discord_id):
-    user = get_user(discord_id)
-    if not user:
-        create_user(discord_id)
-        return 0
-    return user["balance"]
-
-def update_balance(discord_id, amount):
+    """Get balance from API or Supabase"""
     user = get_user(discord_id)
     if not user:
         create_user(discord_id)
         user = get_user(discord_id)
 
-    new_balance = user["balance"] + amount
-    supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
-    return new_balance
+    # Use API if configured
+    if API_URL:
+        try:
+            r = requests.get(f"{API_URL}/balance/{user['uuid']}", headers={"x-api-key": API_KEY})
+            return r.json().get("balance", 0)
+        except Exception:
+            return user["balance"]
+    return user["balance"]
 
-# ================= COMMANDS =================
+def update_balance(discord_id, amount):
+    """Update balance via API or Supabase"""
+    user = get_user(discord_id)
+    if not user:
+        create_user(discord_id)
+        user = get_user(discord_id)
+
+    if API_URL:
+        try:
+            # For simplicity, queue as /give call if positive, negative handled locally
+            if amount > 0:
+                requests.post(f"{API_URL}/give", json={
+                    "uuid": user["uuid"],
+                    "item": "currency",
+                    "amount": amount
+                }, headers={"x-api-key": API_KEY})
+                return get_balance(discord_id)
+            else:
+                # Negative amount: update locally (Supabase) to avoid negative API items
+                new_balance = user["balance"] + amount
+                supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
+                return new_balance
+        except Exception:
+            # fallback to local Supabase
+            new_balance = user["balance"] + amount
+            supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
+            return new_balance
+    else:
+        new_balance = user["balance"] + amount
+        supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
+        return new_balance
+
+# ---------------- COMMANDS ----------------
 
 @tree.command(name="help", description="Show all economy commands")
 async def help_cmd(interaction: discord.Interaction):
@@ -79,7 +119,6 @@ async def balance(interaction: discord.Interaction):
 async def give(interaction: discord.Interaction, user: discord.User, amount: float):
     if amount <= 0:
         return await interaction.response.send_message("❌ Invalid amount.")
-
     sender_balance = get_balance(interaction.user.id)
     if sender_balance < amount:
         return await interaction.response.send_message("❌ Not enough money.")
@@ -125,10 +164,8 @@ async def buy(interaction: discord.Interaction, listing_id: int):
     listing = supabase.table("marketplace").select("*").eq("id", listing_id).execute().data
     if not listing:
         return await interaction.response.send_message("❌ Listing not found.")
-
     listing = listing[0]
     total_price = listing["price"] * listing["amount"]
-
     buyer_balance = get_balance(interaction.user.id)
     if buyer_balance < total_price:
         return await interaction.response.send_message("❌ Not enough money.")
@@ -136,11 +173,9 @@ async def buy(interaction: discord.Interaction, listing_id: int):
     buyer = get_user(interaction.user.id)
     seller = supabase.table("users").select("*").eq("uuid", listing["seller_uuid"]).execute().data[0]
 
-    # Transfer money
     update_balance(interaction.user.id, -total_price)
     update_balance(seller["discord_id"], total_price)
 
-    # Log transaction
     supabase.table("transactions").insert({
         "buyer_uuid": buyer["uuid"],
         "seller_uuid": seller["uuid"],
@@ -149,13 +184,11 @@ async def buy(interaction: discord.Interaction, listing_id: int):
         "price": listing["price"]
     }).execute()
 
-    # Delete listing
     supabase.table("marketplace").delete().eq("id", listing_id).execute()
 
     await interaction.response.send_message(f"✅ Bought {listing['amount']}x {listing['item']} for {total_price}")
 
-# ================= ADMIN =================
-
+# ---------------- ADMIN ----------------
 @tree.command(name="addmoney", description="Admin: Add money")
 @app_commands.checks.has_permissions(administrator=True)
 async def addmoney(interaction: discord.Interaction, user: discord.User, amount: float):
@@ -168,8 +201,7 @@ async def removemoney(interaction: discord.Interaction, user: discord.User, amou
     update_balance(user.id, -amount)
     await interaction.response.send_message(f"💸 Removed {amount} from {user.mention}")
 
-# ================= STARTUP =================
-
+# ---------------- STARTUP ----------------
 @bot.event
 async def on_ready():
     await tree.sync()
