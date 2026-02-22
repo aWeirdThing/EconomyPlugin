@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # ---------------- LOAD ENV ----------------
 load_dotenv()  # optional locally
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://daylvvjjuxxqrkreakwf.supabase.co/the")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # Must be service role key
 API_KEY = os.getenv("API_KEY")  # Optional secret key for external calls
 PORT = int(os.getenv("PORT", 8000))  # Railway sets $PORT automatically
@@ -28,6 +28,12 @@ class GiveItemRequest(BaseModel):
     uuid: str
     item: str
     amount: int
+
+class DeliverItemRequest(BaseModel):
+    uuid: str
+    item: str
+    amount: int
+    listing_id: int
 
 # ---------------- AUTH ----------------
 def verify_api_key(x_api_key: str = Header(None)):
@@ -64,6 +70,30 @@ def give_item(data: GiveItemRequest, x_api_key: str = Header(None)):
         "amount": data.amount
     }).execute()
     return {"status": "queued", "uuid": data.uuid, "item": data.item, "amount": data.amount}
+
+@app.post("/deliver_item", summary="Deliver a purchased item from marketplace to user")
+def deliver_item(data: DeliverItemRequest, x_api_key: str = Header(None)):
+    """
+    Used by the bot after a /buy command. Removes item from marketplace and adds to pending_items.
+    """
+    verify_api_key(x_api_key)
+    # Check listing exists
+    listing = supabase.table("marketplace").select("*").eq("id", data.listing_id).execute().data
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    listing = listing[0]
+    # Remove listing from marketplace
+    supabase.table("marketplace").delete().eq("id", data.listing_id).execute()
+
+    # Queue item for delivery to Minecraft player
+    supabase.table("pending_items").insert({
+        "uuid": data.uuid,
+        "item": data.item,
+        "amount": data.amount
+    }).execute()
+
+    return {"status": "delivered", "uuid": data.uuid, "item": data.item, "amount": data.amount}
 
 # Optional health check
 @app.get("/health", summary="Health check endpoint")
