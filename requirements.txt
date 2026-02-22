@@ -2,3 +2,4 @@ discord.py
 supabase
 fastapi
 uvicorn
+python-dotenv
