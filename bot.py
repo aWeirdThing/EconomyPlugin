@@ -4,6 +4,8 @@ from discord import app_commands
 import uuid
 import firebase_admin
 from firebase_admin import credentials, firestore
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------- LOAD ENV ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -26,6 +28,13 @@ db = firestore.client()
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+# ---------------- THREAD POOL FOR FIRESTORE ----------------
+executor = ThreadPoolExecutor()
+
+async def run_in_executor(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, lambda: func(*args))
 
 # ---------------- DATABASE FUNCTIONS ----------------
 def get_user(discord_id):
@@ -57,15 +66,28 @@ def update_balance(discord_id, amount):
     db.collection("users").document(str(discord_id)).update({"balance": new_balance})
     return new_balance
 
+# ---------------- ASYNC DATABASE HELPERS ----------------
+async def async_get_user(discord_id):
+    return await run_in_executor(get_user, discord_id)
+
+async def async_create_user(discord_id):
+    return await run_in_executor(create_user, discord_id)
+
+async def async_get_balance(discord_id):
+    return await run_in_executor(get_balance, discord_id)
+
+async def async_update_balance(discord_id, amount):
+    return await run_in_executor(update_balance, discord_id, amount)
+
 # ---------------- COMMANDS ----------------
 @tree.command(name="link", description="Link your Discord account to the economy system")
 async def link(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    user = get_user(interaction.user.id)
+    user = await async_get_user(interaction.user.id)
     if user:
         await interaction.followup.send("🔗 Your account is already linked!", ephemeral=True)
     else:
-        create_user(interaction.user.id)
+        await async_create_user(interaction.user.id)
         await interaction.followup.send("✅ Account linked successfully!", ephemeral=True)
 
 @tree.command(name="help", description="Show all economy commands")
@@ -89,7 +111,7 @@ async def help_cmd(interaction: discord.Interaction):
 @tree.command(name="balance", description="Check your balance")
 async def balance(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    bal = get_balance(interaction.user.id)
+    bal = await async_get_balance(interaction.user.id)
     await interaction.followup.send(f"💰 Your balance: **{bal}**", ephemeral=True)
 
 @tree.command(name="give", description="Give money to another user")
@@ -97,34 +119,37 @@ async def give(interaction: discord.Interaction, user: discord.User, amount: flo
     await interaction.response.defer(ephemeral=True)
     if amount <= 0:
         return await interaction.followup.send("❌ Invalid amount.", ephemeral=True)
-    sender_balance = get_balance(interaction.user.id)
+    
+    sender_balance = await async_get_balance(interaction.user.id)
     if sender_balance < amount:
         return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
 
-    update_balance(interaction.user.id, -amount)
-    update_balance(user.id, amount)
+    await async_update_balance(interaction.user.id, -amount)
+    await async_update_balance(user.id, amount)
     await interaction.followup.send(f"✅ Gave {amount} to {user.mention}", ephemeral=True)
 
 @tree.command(name="sell", description="List an item on the marketplace")
 async def sell(interaction: discord.Interaction, item: str, amount: int, price: float):
     await interaction.response.defer(ephemeral=True)
-    user = get_user(interaction.user.id)
+    user = await async_get_user(interaction.user.id)
     if not user:
-        create_user(interaction.user.id)
-        user = get_user(interaction.user.id)
+        await async_create_user(interaction.user.id)
+        user = await async_get_user(interaction.user.id)
 
-    db.collection("marketplace").add({
-        "seller_uuid": user["uuid"],
-        "item": item,
-        "amount": amount,
-        "price": price
-    })
+    await run_in_executor(
+        lambda: db.collection("marketplace").add({
+            "seller_uuid": user["uuid"],
+            "item": item,
+            "amount": amount,
+            "price": price
+        })
+    )
     await interaction.followup.send(f"📦 Listed {amount}x {item} for {price} each.", ephemeral=True)
 
 @tree.command(name="market", description="View marketplace listings")
 async def market(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    docs = db.collection("marketplace").limit(15).stream()
+    docs = await run_in_executor(lambda: list(db.collection("marketplace").limit(15).stream()))
     listings = [doc.to_dict() | {"id": doc.id} for doc in docs]
 
     if not listings:
@@ -139,18 +164,18 @@ async def market(interaction: discord.Interaction):
 async def buy(interaction: discord.Interaction, listing_id: str):
     await interaction.response.defer(ephemeral=True)
     listing_ref = db.collection("marketplace").document(listing_id)
-    listing_doc = listing_ref.get()
+    listing_doc = await run_in_executor(listing_ref.get)
     if not listing_doc.exists:
         return await interaction.followup.send("❌ Listing not found.", ephemeral=True)
 
     listing = listing_doc.to_dict()
     total_price = listing["price"] * listing["amount"]
-    buyer_balance = get_balance(interaction.user.id)
+    buyer_balance = await async_get_balance(interaction.user.id)
     if buyer_balance < total_price:
         return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
 
-    buyer = get_user(interaction.user.id)
-    seller_docs = db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()
+    buyer = await async_get_user(interaction.user.id)
+    seller_docs = await run_in_executor(lambda: list(db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()))
     seller = None
     for s in seller_docs:
         seller = s.to_dict()
@@ -158,18 +183,18 @@ async def buy(interaction: discord.Interaction, listing_id: str):
     if not seller:
         return await interaction.followup.send("❌ Seller not found.", ephemeral=True)
 
-    update_balance(interaction.user.id, -total_price)
-    update_balance(seller["discord_id"], total_price)
+    await async_update_balance(interaction.user.id, -total_price)
+    await async_update_balance(seller["discord_id"], total_price)
 
-    db.collection("transactions").add({
+    await run_in_executor(lambda: db.collection("transactions").add({
         "buyer_uuid": buyer["uuid"],
         "seller_uuid": seller["uuid"],
         "item": listing["item"],
         "amount": listing["amount"],
         "price": listing["price"]
-    })
+    }))
 
-    listing_ref.delete()
+    await run_in_executor(listing_ref.delete)
     await interaction.followup.send(f"✅ Bought {listing['amount']}x {listing['item']} for {total_price}", ephemeral=True)
 
 # ---------------- ADMIN ----------------
@@ -177,14 +202,14 @@ async def buy(interaction: discord.Interaction, listing_id: str):
 @app_commands.checks.has_permissions(administrator=True)
 async def addmoney(interaction: discord.Interaction, user: discord.User, amount: float):
     await interaction.response.defer(ephemeral=True)
-    update_balance(user.id, amount)
+    await async_update_balance(user.id, amount)
     await interaction.followup.send(f"💸 Added {amount} to {user.mention}", ephemeral=True)
 
 @tree.command(name="removemoney", description="Admin: Remove money")
 @app_commands.checks.has_permissions(administrator=True)
 async def removemoney(interaction: discord.Interaction, user: discord.User, amount: float):
     await interaction.response.defer(ephemeral=True)
-    update_balance(user.id, -amount)
+    await async_update_balance(user.id, -amount)
     await interaction.followup.send(f"💸 Removed {amount} from {user.mention}", ephemeral=True)
 
 # ---------------- STARTUP ----------------
