@@ -2,25 +2,27 @@ import os
 import discord
 from discord import app_commands
 import uuid
-import requests
-from supabase import create_client
-from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ---------------- LOAD ENV ----------------
-load_dotenv()
-
-# Discord + Supabase
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
 
-# Optional API settings
-API_URL = os.getenv("API_URL")  # e.g., https://my-economy-api.up.railway.app
-API_KEY = os.getenv("API_KEY")  # optional secret key for API calls
+# ---------------- FIREBASE INIT ----------------
+cred = credentials.Certificate({
+    "type": "service_account",
+    "project_id": FIREBASE_PROJECT_ID,
+    "private_key": FIREBASE_PRIVATE_KEY,
+    "client_email": FIREBASE_CLIENT_EMAIL,
+    "token_uri": "https://oauth2.googleapis.com/token"
+})
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Discord setup
+# ---------------- DISCORD SETUP ----------------
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
@@ -28,67 +30,39 @@ tree = app_commands.CommandTree(bot)
 # ---------------- DATABASE FUNCTIONS ----------------
 
 def get_user(discord_id):
-    """Get user info from Supabase"""
-    res = supabase.table("users").select("*").eq("discord_id", str(discord_id)).execute()
-    return res.data[0] if res.data else None
+    """Get user info from Firestore"""
+    doc = db.collection("users").document(str(discord_id)).get()
+    if doc.exists:
+        return doc.to_dict()
+    return None
 
 def create_user(discord_id):
-    """Create new user in Supabase"""
+    """Create new user in Firestore"""
     uid = str(uuid.uuid4())
-    supabase.table("users").insert({
+    db.collection("users").document(str(discord_id)).set({
         "uuid": uid,
         "discord_id": str(discord_id),
         "balance": 0
-    }).execute()
+    })
     return uid
 
 def get_balance(discord_id):
-    """Get balance from API or Supabase"""
+    """Get user balance"""
     user = get_user(discord_id)
     if not user:
         create_user(discord_id)
         user = get_user(discord_id)
-
-    # Use API if configured
-    if API_URL:
-        try:
-            r = requests.get(f"{API_URL}/balance/{user['uuid']}", headers={"x-api-key": API_KEY})
-            return r.json().get("balance", 0)
-        except Exception:
-            return user["balance"]
     return user["balance"]
 
 def update_balance(discord_id, amount):
-    """Update balance via API or Supabase"""
+    """Update user balance"""
     user = get_user(discord_id)
     if not user:
         create_user(discord_id)
         user = get_user(discord_id)
-
-    if API_URL:
-        try:
-            # For simplicity, queue as /give call if positive, negative handled locally
-            if amount > 0:
-                requests.post(f"{API_URL}/give", json={
-                    "uuid": user["uuid"],
-                    "item": "currency",
-                    "amount": amount
-                }, headers={"x-api-key": API_KEY})
-                return get_balance(discord_id)
-            else:
-                # Negative amount: update locally (Supabase) to avoid negative API items
-                new_balance = user["balance"] + amount
-                supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
-                return new_balance
-        except Exception:
-            # fallback to local Supabase
-            new_balance = user["balance"] + amount
-            supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
-            return new_balance
-    else:
-        new_balance = user["balance"] + amount
-        supabase.table("users").update({"balance": new_balance}).eq("discord_id", str(discord_id)).execute()
-        return new_balance
+    new_balance = user["balance"] + amount
+    db.collection("users").document(str(discord_id)).update({"balance": new_balance})
+    return new_balance
 
 # ---------------- COMMANDS ----------------
 
@@ -136,56 +110,65 @@ async def sell(interaction: discord.Interaction, item: str, amount: int, price: 
         create_user(interaction.user.id)
         user = get_user(interaction.user.id)
 
-    supabase.table("marketplace").insert({
+    db.collection("marketplace").add({
         "seller_uuid": user["uuid"],
         "item": item,
         "amount": amount,
         "price": price
-    }).execute()
+    })
 
     await interaction.response.send_message(f"📦 Listed {amount}x {item} for {price} each.")
 
 # -------- MARKETPLACE --------
 @tree.command(name="market", description="View marketplace listings")
 async def market(interaction: discord.Interaction):
-    data = supabase.table("marketplace").select("*").execute().data
-    if not data:
+    docs = db.collection("marketplace").limit(15).stream()
+    listings = [doc.to_dict() | {"id": doc.id} for doc in docs]
+
+    if not listings:
         return await interaction.response.send_message("📭 Marketplace is empty.")
 
     msg = "**🛒 Marketplace Listings**\n"
-    for row in data[:15]:
+    for row in listings:
         msg += f"ID `{row['id']}` | {row['amount']}x {row['item']} | {row['price']} each\n"
 
     await interaction.response.send_message(msg)
 
 # -------- BUY --------
 @tree.command(name="buy", description="Buy a marketplace listing")
-async def buy(interaction: discord.Interaction, listing_id: int):
-    listing = supabase.table("marketplace").select("*").eq("id", listing_id).execute().data
-    if not listing:
+async def buy(interaction: discord.Interaction, listing_id: str):
+    listing_ref = db.collection("marketplace").document(listing_id)
+    listing_doc = listing_ref.get()
+    if not listing_doc.exists:
         return await interaction.response.send_message("❌ Listing not found.")
-    listing = listing[0]
+    listing = listing_doc.to_dict()
     total_price = listing["price"] * listing["amount"]
     buyer_balance = get_balance(interaction.user.id)
     if buyer_balance < total_price:
         return await interaction.response.send_message("❌ Not enough money.")
 
     buyer = get_user(interaction.user.id)
-    seller = supabase.table("users").select("*").eq("uuid", listing["seller_uuid"]).execute().data[0]
+    # Find seller by uuid
+    seller_docs = db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()
+    seller = None
+    for s in seller_docs:
+        seller = s.to_dict()
+        break
+    if not seller:
+        return await interaction.response.send_message("❌ Seller not found.")
 
     update_balance(interaction.user.id, -total_price)
     update_balance(seller["discord_id"], total_price)
 
-    supabase.table("transactions").insert({
+    db.collection("transactions").add({
         "buyer_uuid": buyer["uuid"],
         "seller_uuid": seller["uuid"],
         "item": listing["item"],
         "amount": listing["amount"],
         "price": listing["price"]
-    }).execute()
+    })
 
-    supabase.table("marketplace").delete().eq("id", listing_id).execute()
-
+    listing_ref.delete()
     await interaction.response.send_message(f"✅ Bought {listing['amount']}x {listing['item']} for {total_price}")
 
 # ---------------- ADMIN ----------------
