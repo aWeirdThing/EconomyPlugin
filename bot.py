@@ -38,33 +38,43 @@ async def run_in_executor(func, *args):
 
 # ---------------- DATABASE FUNCTIONS ----------------
 def get_user(discord_id):
-    doc = db.collection("users").document(str(discord_id)).get()
-    return doc.to_dict() if doc.exists else None
+    try:
+        doc = db.collection("users").document(str(discord_id)).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as e:
+        print(f"[ERROR] get_user({discord_id}): {e}")
+        return None
 
 def create_user(discord_id):
-    uid = str(uuid.uuid4())
-    db.collection("users").document(str(discord_id)).set({
-        "uuid": uid,
-        "discord_id": str(discord_id),
-        "balance": 0
-    })
-    return uid
+    try:
+        uid = str(uuid.uuid4())
+        db.collection("users").document(str(discord_id)).set({
+            "uuid": uid,
+            "discord_id": str(discord_id),
+            "balance": 0
+        })
+        return uid
+    except Exception as e:
+        print(f"[ERROR] create_user({discord_id}): {e}")
+        return None
 
 def get_balance(discord_id):
     user = get_user(discord_id)
     if not user:
         create_user(discord_id)
         user = get_user(discord_id)
-    return user["balance"]
+    return user["balance"] if user else 0
 
 def update_balance(discord_id, amount):
     user = get_user(discord_id)
     if not user:
         create_user(discord_id)
         user = get_user(discord_id)
-    new_balance = user["balance"] + amount
-    db.collection("users").document(str(discord_id)).update({"balance": new_balance})
-    return new_balance
+    if user:
+        new_balance = user["balance"] + amount
+        db.collection("users").document(str(discord_id)).update({"balance": new_balance})
+        return new_balance
+    return 0
 
 # ---------------- ASYNC HELPERS ----------------
 async def async_get_user(discord_id):
@@ -91,25 +101,24 @@ async def link(interaction: discord.Interaction):
         await async_create_user(interaction.user.id)
         await interaction.followup.send("✅ Account linked successfully!", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send("❌ Failed to link your account. Check bot logs.", ephemeral=True)
+        await interaction.followup.send("❌ Failed to link your account.", ephemeral=True)
         print(f"[ERROR] /link: {e}")
 
 @tree.command(name="help", description="Show all economy commands")
 async def help_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    msg = """
-**💰 Economy Commands**
-/link - Link your account  
-/balance - Check your balance  
-/sell item amount price - List item  
-/market - View listings  
-/buy listing_id - Buy listing  
-/give user amount - Give money  
-
-**👑 Admin Commands**
-/addmoney user amount  
-/removemoney user amount  
-"""
+    msg = (
+        "**💰 Economy Commands**\n"
+        "/link - Link your account  \n"
+        "/balance - Check your balance  \n"
+        "/sell item amount price - List item  \n"
+        "/market - View listings  \n"
+        "/buy listing_id - Buy listing  \n"
+        "/give user amount - Give money  \n\n"
+        "**👑 Admin Commands**\n"
+        "/addmoney user amount  \n"
+        "/removemoney user amount"
+    )
     await interaction.followup.send(msg, ephemeral=True)
 
 @tree.command(name="balance", description="Check your balance")
@@ -188,10 +197,7 @@ async def buy(interaction: discord.Interaction, listing_id: str):
             return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
         buyer = await async_get_user(interaction.user.id)
         seller_docs = await run_in_executor(lambda: list(db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()))
-        seller = None
-        for s in seller_docs:
-            seller = s.to_dict()
-            break
+        seller = next((s.to_dict() for s in seller_docs), None)
         if not seller:
             return await interaction.followup.send("❌ Seller not found.", ephemeral=True)
         await async_update_balance(interaction.user.id, -total_price)
@@ -209,7 +215,7 @@ async def buy(interaction: discord.Interaction, listing_id: str):
         await interaction.followup.send("❌ Failed to buy item.", ephemeral=True)
         print(f"[ERROR] /buy: {e}")
 
-# ---------------- ADMIN COMMANDS ----------------
+# ---------------- ADMIN ----------------
 @tree.command(name="addmoney", description="Admin: Add money")
 @app_commands.checks.has_permissions(administrator=True)
 async def addmoney(interaction: discord.Interaction, user: discord.User, amount: float):
