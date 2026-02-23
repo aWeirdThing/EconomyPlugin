@@ -1,6 +1,7 @@
 import os
 import discord
 from discord import app_commands
+from discord.ext import commands
 import uuid
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -12,6 +13,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
+MARKET_CHANNEL_ID = 1475144850826592267  # Channel to send marketplace embeds
 
 # ---------------- FIREBASE INIT ----------------
 cred = credentials.Certificate({
@@ -26,12 +28,11 @@ db = firestore.client()
 
 # ---------------- DISCORD SETUP ----------------
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
-
-# ---------------- THREAD POOL FOR FIRESTORE ----------------
+bot = commands.Bot(command_prefix="!", intents=intents)  # Use commands.Bot for app_commands
+tree = bot.tree
 executor = ThreadPoolExecutor(max_workers=20)
 
+# ---------------- FIRESTORE EXECUTOR ----------------
 async def run_in_executor(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, lambda: func(*args))
@@ -72,7 +73,7 @@ def update_balance(discord_id, amount):
         user = get_user(discord_id)
     if user:
         new_balance = user["balance"] + amount
-        db.collection("users").document(str(discord_id)).update({"balance": new_balance})
+        db.collection("users").document(str(discord_id)).set({"balance": new_balance}, merge=True)
         return new_balance
     return 0
 
@@ -103,23 +104,6 @@ async def link(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send("❌ Failed to link your account.", ephemeral=True)
         print(f"[ERROR] /link: {e}")
-
-@tree.command(name="help", description="Show all economy commands")
-async def help_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    msg = (
-        "**💰 Economy Commands**\n"
-        "/link - Link your account  \n"
-        "/balance - Check your balance  \n"
-        "/sell item amount price - List item  \n"
-        "/market - View listings  \n"
-        "/buy listing_id - Buy listing  \n"
-        "/give user amount - Give money  \n\n"
-        "**👑 Admin Commands**\n"
-        "/addmoney user amount  \n"
-        "/removemoney user amount"
-    )
-    await interaction.followup.send(msg, ephemeral=True)
 
 @tree.command(name="balance", description="Check your balance")
 async def balance(interaction: discord.Interaction):
@@ -155,12 +139,24 @@ async def sell(interaction: discord.Interaction, item: str, amount: int, price: 
         if not user:
             await async_create_user(interaction.user.id)
             user = await async_get_user(interaction.user.id)
-        await run_in_executor(lambda: db.collection("marketplace").add({
+        listing_ref = await run_in_executor(lambda: db.collection("marketplace").add({
             "seller_uuid": user["uuid"],
             "item": item,
             "amount": amount,
             "price": price
         }))
+        doc_id = listing_ref[1].id if isinstance(listing_ref, tuple) else listing_ref.id
+
+        # Send embed to channel
+        channel = bot.get_channel(MARKET_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(title="📦 New Marketplace Listing", color=discord.Color.green())
+            embed.add_field(name="Item", value=item, inline=True)
+            embed.add_field(name="Amount", value=str(amount), inline=True)
+            embed.add_field(name="Price", value=str(price), inline=True)
+            embed.add_field(name="Listing ID", value=doc_id, inline=True)
+            await channel.send(embed=embed)
+
         await interaction.followup.send(f"📦 Listed {amount}x {item} for {price} each.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send("❌ Failed to list item.", ephemeral=True)
@@ -171,7 +167,7 @@ async def market(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         docs = await run_in_executor(lambda: list(db.collection("marketplace").limit(15).stream()))
-        listings = [doc.to_dict() | {"id": doc.id} for doc in docs]
+        listings = [dict(doc.to_dict(), id=doc.id) for doc in docs]
         if not listings:
             return await interaction.followup.send("📭 Marketplace is empty.", ephemeral=True)
         msg = "**🛒 Marketplace Listings**\n"
@@ -195,11 +191,13 @@ async def buy(interaction: discord.Interaction, listing_id: str):
         buyer_balance = await async_get_balance(interaction.user.id)
         if buyer_balance < total_price:
             return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
+
         buyer = await async_get_user(interaction.user.id)
         seller_docs = await run_in_executor(lambda: list(db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()))
         seller = next((s.to_dict() for s in seller_docs), None)
         if not seller:
             return await interaction.followup.send("❌ Seller not found.", ephemeral=True)
+
         await async_update_balance(interaction.user.id, -total_price)
         await async_update_balance(seller["discord_id"], total_price)
         await run_in_executor(lambda: db.collection("transactions").add({
@@ -215,7 +213,7 @@ async def buy(interaction: discord.Interaction, listing_id: str):
         await interaction.followup.send("❌ Failed to buy item.", ephemeral=True)
         print(f"[ERROR] /buy: {e}")
 
-# ---------------- ADMIN ----------------
+# ---------------- ADMIN COMMANDS ----------------
 @tree.command(name="addmoney", description="Admin: Add money")
 @app_commands.checks.has_permissions(administrator=True)
 async def addmoney(interaction: discord.Interaction, user: discord.User, amount: float):
@@ -241,6 +239,7 @@ async def removemoney(interaction: discord.Interaction, user: discord.User, amou
 # ---------------- STARTUP ----------------
 @bot.event
 async def on_ready():
+    # Sync slash commands globally or to a test guild
     await tree.sync()
     print(f"✅ Bot online as {bot.user}")
 
