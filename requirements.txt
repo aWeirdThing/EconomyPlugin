@@ -1,5 +1,4 @@
-discord.py
-supabase
-fastapi
-uvicorn
-python-dotenv
+discord.py==2.7.3
+firebase-admin==6.1.0
+python-dotenv==1.0.0
+requests==2.32.0
