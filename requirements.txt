@@ -1,5 +1,4 @@
 discord.py
-firebase-admin
+aiohttp
 python-dotenv
-requests
-
+pytz
