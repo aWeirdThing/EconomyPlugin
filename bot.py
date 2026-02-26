@@ -2,244 +2,216 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
-import uuid
-import firebase_admin
-from firebase_admin import credentials, firestore
+import aiohttp
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
-# ---------------- LOAD ENV ----------------
+# ---------------- ENV ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
-FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY").replace("\\n", "\n")
-FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
-MARKET_CHANNEL_ID = 1475144850826592267  # Channel to send marketplace embeds
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# ---------------- FIREBASE INIT ----------------
-cred = credentials.Certificate({
-    "type": "service_account",
-    "project_id": FIREBASE_PROJECT_ID,
-    "private_key": FIREBASE_PRIVATE_KEY,
-    "client_email": FIREBASE_CLIENT_EMAIL,
-    "token_uri": "https://oauth2.googleapis.com/token"
-})
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+MARKET_CHANNEL_ID = 1475144850826592267
 
 # ---------------- DISCORD SETUP ----------------
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)  # Use commands.Bot for app_commands
+bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-executor = ThreadPoolExecutor(max_workers=20)
 
-# ---------------- FIRESTORE EXECUTOR ----------------
-async def run_in_executor(func, *args):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, lambda: func(*args))
+# ---------------- SUPABASE HELPERS ----------------
+async def supabase_get(session, table, params=""):
+    url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+    async with session.get(url, headers=headers) as res:
+        return await res.json(), res.status
 
-# ---------------- DATABASE FUNCTIONS ----------------
-def get_user(discord_id):
-    try:
-        doc = db.collection("users").document(str(discord_id)).get()
-        return doc.to_dict() if doc.exists else None
-    except Exception as e:
-        print(f"[ERROR] get_user({discord_id}): {e}")
-        return None
+async def supabase_post(session, table, data):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Prefer": "return=representation",
+        "Content-Type": "application/json"
+    }
+    async with session.post(url, headers=headers, json=data) as res:
+        return await res.json(), res.status
 
-def create_user(discord_id):
-    try:
-        uid = str(uuid.uuid4())
-        db.collection("users").document(str(discord_id)).set({
-            "uuid": uid,
-            "discord_id": str(discord_id),
-            "balance": 0
+async def supabase_patch(session, table, params, data):
+    url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+    async with session.patch(url, headers=headers, json=data) as res:
+        return await res.json(), res.status
+
+# ============================================================
+# /link CODE — Discord side of account linking
+# ============================================================
+@tree.command(name="link", description="Link your Discord account to your Minecraft account")
+async def link(interaction: discord.Interaction, code: str):
+    await interaction.response.defer(ephemeral=True)
+
+    async with aiohttp.ClientSession() as session:
+        # 1. Look up link code
+        data, status = await supabase_get(session, "link_codes", f"?code=eq.{code}&used=eq.false")
+
+        if status != 200 or len(data) == 0:
+            return await interaction.followup.send("❌ Invalid or already used link code.", ephemeral=True)
+
+        entry = data[0]
+        mc_uuid = entry["mc_uuid"]
+
+        # 2. Insert/update accounts table
+        account_data = {
+            "mc_uuid": mc_uuid,
+            "discord_id": str(interaction.user.id)
+        }
+
+        await supabase_post(session, "accounts", account_data)
+
+        # 3. Mark code as used
+        await supabase_patch(session, "link_codes", f"?code=eq.{code}", {
+            "used": True,
+            "discord_id": str(interaction.user.id)
         })
-        return uid
-    except Exception as e:
-        print(f"[ERROR] create_user({discord_id}): {e}")
-        return None
 
-def get_balance(discord_id):
-    user = get_user(discord_id)
-    if not user:
-        create_user(discord_id)
-        user = get_user(discord_id)
-    return user["balance"] if user else 0
+        await interaction.followup.send("✅ Your Discord account is now linked to your Minecraft account!", ephemeral=True)
 
-def update_balance(discord_id, amount):
-    user = get_user(discord_id)
-    if not user:
-        create_user(discord_id)
-        user = get_user(discord_id)
-    if user:
-        new_balance = user["balance"] + amount
-        db.collection("users").document(str(discord_id)).set({"balance": new_balance}, merge=True)
-        return new_balance
-    return 0
-
-# ---------------- ASYNC HELPERS ----------------
-async def async_get_user(discord_id):
-    return await run_in_executor(get_user, discord_id)
-
-async def async_create_user(discord_id):
-    return await run_in_executor(create_user, discord_id)
-
-async def async_get_balance(discord_id):
-    return await run_in_executor(get_balance, discord_id)
-
-async def async_update_balance(discord_id, amount):
-    return await run_in_executor(update_balance, discord_id, amount)
-
-# ---------------- COMMANDS ----------------
-@tree.command(name="link", description="Link your Discord account to the economy system")
-async def link(interaction: discord.Interaction):
+# ============================================================
+# /market — View active marketplace listings
+# ============================================================
+@tree.command(name="market", description="View the global marketplace")
+async def market(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    try:
-        user = await async_get_user(interaction.user.id)
-        if user:
-            await interaction.followup.send("🔗 Your account is already linked!", ephemeral=True)
-            return
-        await async_create_user(interaction.user.id)
-        await interaction.followup.send("✅ Account linked successfully!", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to link your account.", ephemeral=True)
-        print(f"[ERROR] /link: {e}")
 
-@tree.command(name="balance", description="Check your balance")
-async def balance(interaction: discord.Interaction):
+    async with aiohttp.ClientSession() as session:
+        data, status = await supabase_get(
+            session,
+            "marketplace_listings",
+            "?status=eq.active&select=id,item_type,amount,price"
+        )
+
+        if status != 200:
+            return await interaction.followup.send("❌ Failed to load marketplace.", ephemeral=True)
+
+        if len(data) == 0:
+            return await interaction.followup.send("📭 Marketplace is empty.", ephemeral=True)
+
+        msg = "**🛒 Marketplace Listings**\n"
+        for row in data:
+            msg += f"**#{row['id']}** — {row['amount']}x `{row['item_type']}` for **{row['price']}**\n"
+
+        await interaction.followup.send(msg, ephemeral=True)
+
+# ============================================================
+# /buy ID — Buy a listing
+# ============================================================
+@tree.command(name="buy", description="Buy a marketplace listing")
+async def buy(interaction: discord.Interaction, listing_id: int):
     await interaction.response.defer(ephemeral=True)
-    try:
-        bal = await async_get_balance(interaction.user.id)
-        await interaction.followup.send(f"💰 Your balance: **{bal}**", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to fetch balance.", ephemeral=True)
-        print(f"[ERROR] /balance: {e}")
 
-@tree.command(name="give", description="Give money to another user")
-async def give(interaction: discord.Interaction, user: discord.User, amount: float):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        if amount <= 0:
-            return await interaction.followup.send("❌ Invalid amount.", ephemeral=True)
-        sender_balance = await async_get_balance(interaction.user.id)
-        if sender_balance < amount:
-            return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
-        await async_update_balance(interaction.user.id, -amount)
-        await async_update_balance(user.id, amount)
-        await interaction.followup.send(f"✅ Gave {amount} to {user.mention}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to transfer money.", ephemeral=True)
-        print(f"[ERROR] /give: {e}")
+    async with aiohttp.ClientSession() as session:
+        # 1. Fetch listing
+        data, status = await supabase_get(
+            session,
+            "marketplace_listings",
+            f"?id=eq.{listing_id}"
+        )
 
-@tree.command(name="sell", description="List an item on the marketplace")
+        if status != 200 or len(data) == 0:
+            return await interaction.followup.send("❌ Listing not found.", ephemeral=True)
+
+        listing = data[0]
+
+        if listing["status"] != "active":
+            return await interaction.followup.send("❌ This listing is no longer available.", ephemeral=True)
+
+        # 2. Get buyer's linked MC UUID
+        acc, acc_status = await supabase_get(
+            session,
+            "accounts",
+            f"?discord_id=eq.{interaction.user.id}"
+        )
+
+        if acc_status != 200 or len(acc) == 0:
+            return await interaction.followup.send("❌ You must link your account first using `/link CODE`.", ephemeral=True)
+
+        buyer_mc_uuid = acc[0]["mc_uuid"]
+
+        # 3. Mark listing as sold
+        await supabase_patch(
+            session,
+            "marketplace_listings",
+            f"?id=eq.{listing_id}",
+            {
+                "status": "sold",
+                "buyer_mc_uuid": buyer_mc_uuid
+            }
+        )
+
+        await interaction.followup.send(
+            f"✅ You bought **{listing['amount']}x {listing['item_type']}**.\n"
+            f"It will be delivered next time you join Minecraft.",
+            ephemeral=True
+        )
+
+# ============================================================
+# /sell — Discord-side listing (optional)
+# ============================================================
+@tree.command(name="sell", description="List an item on the marketplace (Discord-side)")
 async def sell(interaction: discord.Interaction, item: str, amount: int, price: float):
     await interaction.response.defer(ephemeral=True)
-    try:
-        user = await async_get_user(interaction.user.id)
-        if not user:
-            await async_create_user(interaction.user.id)
-            user = await async_get_user(interaction.user.id)
-        listing_ref = await run_in_executor(lambda: db.collection("marketplace").add({
-            "seller_uuid": user["uuid"],
-            "item": item,
-            "amount": amount,
-            "price": price
-        }))
-        doc_id = listing_ref[1].id if isinstance(listing_ref, tuple) else listing_ref.id
 
-        # Send embed to channel
+    async with aiohttp.ClientSession() as session:
+        # Get linked MC UUID
+        acc, acc_status = await supabase_get(
+            session,
+            "accounts",
+            f"?discord_id=eq.{interaction.user.id}"
+        )
+
+        if acc_status != 200 or len(acc) == 0:
+            return await interaction.followup.send("❌ You must link your account first.", ephemeral=True)
+
+        mc_uuid = acc[0]["mc_uuid"]
+
+        # Create listing
+        listing_data = {
+            "seller_mc_uuid": mc_uuid,
+            "item_type": item.upper(),
+            "amount": amount,
+            "price": price,
+            "status": "active"
+        }
+
+        created, status = await supabase_post(session, "marketplace_listings", listing_data)
+
+        if status != 201:
+            return await interaction.followup.send("❌ Failed to create listing.", ephemeral=True)
+
+        listing_id = created[0]["id"]
+
+        # Send embed to marketplace channel
         channel = bot.get_channel(MARKET_CHANNEL_ID)
         if channel:
             embed = discord.Embed(title="📦 New Marketplace Listing", color=discord.Color.green())
-            embed.add_field(name="Item", value=item, inline=True)
+            embed.add_field(name="Item", value=item.upper(), inline=True)
             embed.add_field(name="Amount", value=str(amount), inline=True)
             embed.add_field(name="Price", value=str(price), inline=True)
-            embed.add_field(name="Listing ID", value=doc_id, inline=True)
+            embed.add_field(name="Listing ID", value=str(listing_id), inline=True)
             await channel.send(embed=embed)
 
-        await interaction.followup.send(f"📦 Listed {amount}x {item} for {price} each.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to list item.", ephemeral=True)
-        print(f"[ERROR] /sell: {e}")
+        await interaction.followup.send(f"📦 Listed {amount}x {item} for {price}.", ephemeral=True)
 
-@tree.command(name="market", description="View marketplace listings")
-async def market(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        docs = await run_in_executor(lambda: list(db.collection("marketplace").limit(15).stream()))
-        listings = [dict(doc.to_dict(), id=doc.id) for doc in docs]
-        if not listings:
-            return await interaction.followup.send("📭 Marketplace is empty.", ephemeral=True)
-        msg = "**🛒 Marketplace Listings**\n"
-        for row in listings:
-            msg += f"ID `{row['id']}` | {row['amount']}x {row['item']} | {row['price']} each\n"
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to fetch marketplace.", ephemeral=True)
-        print(f"[ERROR] /market: {e}")
-
-@tree.command(name="buy", description="Buy a marketplace listing")
-async def buy(interaction: discord.Interaction, listing_id: str):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        listing_ref = db.collection("marketplace").document(listing_id)
-        listing_doc = await run_in_executor(listing_ref.get)
-        if not listing_doc.exists:
-            return await interaction.followup.send("❌ Listing not found.", ephemeral=True)
-        listing = listing_doc.to_dict()
-        total_price = listing["price"] * listing["amount"]
-        buyer_balance = await async_get_balance(interaction.user.id)
-        if buyer_balance < total_price:
-            return await interaction.followup.send("❌ Not enough money.", ephemeral=True)
-
-        buyer = await async_get_user(interaction.user.id)
-        seller_docs = await run_in_executor(lambda: list(db.collection("users").where("uuid", "==", listing["seller_uuid"]).stream()))
-        seller = next((s.to_dict() for s in seller_docs), None)
-        if not seller:
-            return await interaction.followup.send("❌ Seller not found.", ephemeral=True)
-
-        await async_update_balance(interaction.user.id, -total_price)
-        await async_update_balance(seller["discord_id"], total_price)
-        await run_in_executor(lambda: db.collection("transactions").add({
-            "buyer_uuid": buyer["uuid"],
-            "seller_uuid": seller["uuid"],
-            "item": listing["item"],
-            "amount": listing["amount"],
-            "price": listing["price"]
-        }))
-        await run_in_executor(listing_ref.delete)
-        await interaction.followup.send(f"✅ Bought {listing['amount']}x {listing['item']} for {total_price}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to buy item.", ephemeral=True)
-        print(f"[ERROR] /buy: {e}")
-
-# ---------------- ADMIN COMMANDS ----------------
-@tree.command(name="addmoney", description="Admin: Add money")
-@app_commands.checks.has_permissions(administrator=True)
-async def addmoney(interaction: discord.Interaction, user: discord.User, amount: float):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        await async_update_balance(user.id, amount)
-        await interaction.followup.send(f"💸 Added {amount} to {user.mention}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to add money.", ephemeral=True)
-        print(f"[ERROR] /addmoney: {e}")
-
-@tree.command(name="removemoney", description="Admin: Remove money")
-@app_commands.checks.has_permissions(administrator=True)
-async def removemoney(interaction: discord.Interaction, user: discord.User, amount: float):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        await async_update_balance(user.id, -amount)
-        await interaction.followup.send(f"💸 Removed {amount} from {user.mention}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send("❌ Failed to remove money.", ephemeral=True)
-        print(f"[ERROR] /removemoney: {e}")
-
-# ---------------- STARTUP ----------------
+# ============================================================
+# STARTUP
+# ============================================================
 @bot.event
 async def on_ready():
-    # Sync slash commands globally or to a test guild
     await tree.sync()
     print(f"✅ Bot online as {bot.user}")
 
