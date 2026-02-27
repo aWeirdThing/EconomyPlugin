@@ -87,7 +87,7 @@ def parse_target(target: str):
 # ---------------- MARKET PAGINATION VIEW ----------------
 class MarketView(discord.ui.View):
     def __init__(self, listings, per_page: int = 10):
-        super().__init__(timeout=None)  # never times out
+        super().__init__(timeout=None)
         self.listings = listings
         self.per_page = per_page
         self.page = 0
@@ -209,7 +209,6 @@ async def link(interaction: discord.Interaction, code: str):
                     {
                         "mc_uuid": mc_uuid,
                         "discord_id": str(interaction.user.id)
-                        # balance uses DB default 100
                     }
                 )
 
@@ -318,7 +317,6 @@ async def buy(interaction: discord.Interaction, listing_id: int):
             if not buyer_acc:
                 return await interaction.followup.send("❌ You must link your account first.")
 
-            # Prevent buying your own listing
             if buyer_acc.get("mc_uuid") == listing.get("seller_mc_uuid"):
                 return await interaction.followup.send("❌ You cannot buy your own listing.")
 
@@ -330,14 +328,12 @@ async def buy(interaction: discord.Interaction, listing_id: int):
 
             seller_acc = await get_account_by_mc_uuid(session, listing["seller_mc_uuid"])
 
-            # Deduct from buyer
             await update_account_balance(
                 session,
                 int(buyer_acc["discord_id"]),
                 buyer_balance - total_cost
             )
 
-            # Pay seller if they have an account
             if seller_acc:
                 seller_balance = float(seller_acc.get("balance", 0))
                 await update_account_balance(
@@ -346,7 +342,6 @@ async def buy(interaction: discord.Interaction, listing_id: int):
                     seller_balance + total_cost
                 )
 
-            # Mark sold
             await supabase_patch(
                 session,
                 "marketplace_listings",
@@ -659,25 +654,21 @@ async def blackjack(interaction: discord.Interaction, amount: float):
                     f"❌ You don't have enough WeirdCoins. You have **{balance:.2f}**."
                 )
 
-            # Deduct bet up front
             new_balance = balance - amount
             await update_account_balance(session, int(acc["discord_id"]), new_balance)
 
-            # Deal initial hands
             player_cards = [draw_card(), draw_card()]
             dealer_cards = [draw_card(), draw_card()]
 
             player_total = hand_value(player_cards)
             dealer_total = hand_value(dealer_cards)
 
-            # Simple strategy: player hits until 17 or more
             while player_total < 17:
                 player_cards.append(draw_card())
                 player_total = hand_value(player_cards)
                 if player_total > 21:
                     break
 
-            # Dealer hits until 17 or more (standard)
             if player_total <= 21:
                 while dealer_total < 17:
                     dealer_cards.append(draw_card())
@@ -690,7 +681,7 @@ async def blackjack(interaction: discord.Interaction, amount: float):
                 result = "💥 You busted and lost your bet."
             elif dealer_total > 21:
                 result = "🎉 Dealer busted, you win!"
-                payout = amount * 2  # give double what they put in
+                payout = amount * 2
             elif player_total > dealer_total:
                 result = "🎉 You win!"
                 payout = amount * 2
@@ -698,7 +689,7 @@ async def blackjack(interaction: discord.Interaction, amount: float):
                 result = "😢 Dealer wins, you lost your bet."
             else:
                 result = "🤝 Push! You get your bet back."
-                payout = amount  # refund
+                payout = amount
 
             if payout > 0:
                 final_balance = new_balance + payout
