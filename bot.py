@@ -1,6 +1,5 @@
 import os
 import discord
-from discord import app_commands
 from discord.ext import commands
 import aiohttp
 
@@ -82,10 +81,9 @@ async def update_account_balance(session, discord_id: int, new_balance: float):
 # ============================================================
 @tree.command(name="link", description="Link your Discord account to your Minecraft account")
 async def link(interaction: discord.Interaction, code: str):
-    await interaction.response.defer()  # public
+    await interaction.response.defer(thinking=True)
 
     async with aiohttp.ClientSession() as session:
-        # 1. Look up link code
         data, status = await supabase_get(
             session,
             "link_codes",
@@ -98,11 +96,9 @@ async def link(interaction: discord.Interaction, code: str):
         entry = data[0]
         mc_uuid = entry["mc_uuid"]
 
-        # 2. Check if account already exists for this Discord
         existing = await get_account_by_discord(session, interaction.user.id)
 
         if existing:
-            # Update mc_uuid, keep existing balance
             await supabase_patch(
                 session,
                 "accounts",
@@ -110,14 +106,13 @@ async def link(interaction: discord.Interaction, code: str):
                 {"mc_uuid": mc_uuid}
             )
         else:
-            # Create new account with default balance (DB default 100)
             account_data = {
                 "mc_uuid": mc_uuid,
                 "discord_id": str(interaction.user.id)
+                # balance uses DB default 100 WeirdCoins
             }
             await supabase_post(session, "accounts", account_data)
 
-        # 3. Mark code as used
         await supabase_patch(
             session,
             "link_codes",
@@ -128,29 +123,37 @@ async def link(interaction: discord.Interaction, code: str):
             }
         )
 
-        await interaction.followup.send("✅ Your Discord account is now linked to your Minecraft account! You start with **100 WeirdCoins**.")
+        await interaction.followup.send(
+            f"✅ {interaction.user.mention}, your Discord account is now linked to your Minecraft account!\n"
+            f"You start with **100 WeirdCoins**."
+        )
 
 # ============================================================
 # /balance — show WeirdCoins
 # ============================================================
 @tree.command(name="balance", description="Check your WeirdCoins balance")
 async def balance(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
 
     async with aiohttp.ClientSession() as session:
         acc = await get_account_by_discord(session, interaction.user.id)
         if not acc:
-            return await interaction.followup.send("❌ You are not linked yet. Use `/link CODE` after doing `/link` in Minecraft.")
+            return await interaction.followup.send(
+                "❌ You are not linked yet.\n"
+                "Run `/link` in Minecraft to get a code, then `/link CODE` here."
+            )
 
         bal = float(acc.get("balance", 0))
-        await interaction.followup.send(f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**.")
+        await interaction.followup.send(
+            f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**."
+        )
 
 # ============================================================
 # /market — view active listings
 # ============================================================
 @tree.command(name="market", description="View the global marketplace")
 async def market(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
 
     async with aiohttp.ClientSession() as session:
         data, status = await supabase_get(
@@ -167,7 +170,10 @@ async def market(interaction: discord.Interaction):
 
         msg = "**🛒 Marketplace Listings**\n"
         for row in data:
-            msg += f"**#{row['id']}** — {row['amount']}x `{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+            msg += (
+                f"**#{row['id']}** — {row['amount']}x "
+                f"`{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+            )
 
         await interaction.followup.send(msg)
 
@@ -176,10 +182,9 @@ async def market(interaction: discord.Interaction):
 # ============================================================
 @tree.command(name="buy", description="Buy a marketplace listing")
 async def buy(interaction: discord.Interaction, listing_id: int):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
 
     async with aiohttp.ClientSession() as session:
-        # 1. Fetch listing
         data, status = await supabase_get(
             session,
             "marketplace_listings",
@@ -198,20 +203,22 @@ async def buy(interaction: discord.Interaction, listing_id: int):
         amount = int(listing["amount"])
         total_cost = price * amount
 
-        # 2. Get buyer account
         buyer_acc = await get_account_by_discord(session, interaction.user.id)
         if not buyer_acc:
-            return await interaction.followup.send("❌ You must link your account first using `/link CODE`.")
+            return await interaction.followup.send(
+                "❌ You must link your account first using `/link CODE`."
+            )
 
         buyer_balance = float(buyer_acc.get("balance", 0))
         if buyer_balance < total_cost:
-            return await interaction.followup.send(f"❌ Not enough WeirdCoins. You need **{total_cost:.2f}**, but you have **{buyer_balance:.2f}**.")
+            return await interaction.followup.send(
+                f"❌ Not enough WeirdCoins. You need **{total_cost:.2f}**, "
+                f"but you have **{buyer_balance:.2f}**."
+            )
 
-        # 3. Get seller account (by seller_mc_uuid)
         seller_mc_uuid = listing["seller_mc_uuid"]
         seller_acc = await get_account_by_mc_uuid(session, seller_mc_uuid)
 
-        # 4. Update balances
         new_buyer_balance = buyer_balance - total_cost
         await update_account_balance(session, int(buyer_acc["discord_id"]), new_buyer_balance)
 
@@ -220,7 +227,7 @@ async def buy(interaction: discord.Interaction, listing_id: int):
             new_seller_balance = seller_balance + total_cost
             await update_account_balance(session, int(seller_acc["discord_id"]), new_seller_balance)
 
-        # 5. Mark listing as sold
+        # Mark listing as sold (pulled from sale)
         await supabase_patch(
             session,
             "marketplace_listings",
@@ -232,17 +239,18 @@ async def buy(interaction: discord.Interaction, listing_id: int):
         )
 
         await interaction.followup.send(
-            f"✅ {interaction.user.mention} bought **{amount}x {listing['item_type']}** for **{total_cost:.2f} WeirdCoins**.\n"
+            f"✅ {interaction.user.mention} bought **{amount}x {listing['item_type']}** "
+            f"for **{total_cost:.2f} WeirdCoins**.\n"
             f"New balance: **{new_buyer_balance:.2f} WeirdCoins**.\n"
-            f"It will be delivered next time you join Minecraft."
+            f"It will be delivered next time you join Minecraft or run `/deliver`."
         )
 
 # ============================================================
-# /sell — Discord-side listing (optional)
+# /sell — Discord-side listing
 # ============================================================
 @tree.command(name="sell", description="List an item on the marketplace (Discord-side)")
 async def sell(interaction: discord.Interaction, item: str, amount: int, price: float):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
 
     async with aiohttp.ClientSession() as session:
         acc = await get_account_by_discord(session, interaction.user.id)
@@ -266,7 +274,6 @@ async def sell(interaction: discord.Interaction, item: str, amount: int, price: 
 
         listing_id = created[0]["id"]
 
-        # Post to marketplace channel
         channel = bot.get_channel(MARKET_CHANNEL_ID)
         if channel:
             embed = discord.Embed(title="📦 New Marketplace Listing", color=discord.Color.green())
@@ -278,7 +285,8 @@ async def sell(interaction: discord.Interaction, item: str, amount: int, price: 
             await channel.send(embed=embed)
 
         await interaction.followup.send(
-            f"📦 Listed **{amount}x {item.upper()}** for **{price} WeirdCoins** as listing **#{listing_id}**."
+            f"📦 Listed **{amount}x {item.upper()}** for **{price} WeirdCoins** "
+            f"as listing **#{listing_id}**."
         )
 
 # ============================================================
