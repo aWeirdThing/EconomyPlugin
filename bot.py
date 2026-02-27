@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 import aiohttp
 import re
+import random
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -147,6 +148,28 @@ class MarketView(discord.ui.View):
     async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = self.max_page()
         await self._update(interaction)
+
+# ---------------- BLACKJACK HELPERS ----------------
+CARD_VALUES = {
+    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6,
+    "7": 7, "8": 8, "9": 9, "10": 10,
+    "J": 10, "Q": 10, "K": 10, "A": 11
+}
+CARD_NAMES = list(CARD_VALUES.keys())
+
+def draw_card():
+    return random.choice(CARD_NAMES)
+
+def hand_value(cards):
+    total = sum(CARD_VALUES[c] for c in cards)
+    aces = cards.count("A")
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    return total
+
+def format_hand(cards):
+    return ", ".join(cards) + f" (total: {hand_value(cards)})"
 
 # ============================================================
 # /link CODE — link Discord ↔ Minecraft
@@ -295,7 +318,7 @@ async def buy(interaction: discord.Interaction, listing_id: int):
             if not buyer_acc:
                 return await interaction.followup.send("❌ You must link your account first.")
 
-            # Prevent buying your own listing (compare Minecraft UUIDs)
+            # Prevent buying your own listing
             if buyer_acc.get("mc_uuid") == listing.get("seller_mc_uuid"):
                 return await interaction.followup.send("❌ You cannot buy your own listing.")
 
@@ -613,6 +636,91 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
     except Exception as e:
         print("TRANSFER ERROR:", e)
         await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /blackjack AMOUNT — gamble WeirdCoins
+# ============================================================
+@tree.command(name="blackjack", description="Play blackjack with a WeirdCoins bet")
+async def blackjack(interaction: discord.Interaction, amount: float):
+    await interaction.response.defer(thinking=True)
+
+    if amount <= 0:
+        return await interaction.followup.send("❌ Bet amount must be positive.")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc:
+                return await interaction.followup.send("❌ You are not linked.")
+
+            balance = float(acc.get("balance", 0))
+            if balance < amount:
+                return await interaction.followup.send(
+                    f"❌ You don't have enough WeirdCoins. You have **{balance:.2f}**."
+                )
+
+            # Deduct bet up front
+            new_balance = balance - amount
+            await update_account_balance(session, int(acc["discord_id"]), new_balance)
+
+            # Deal initial hands
+            player_cards = [draw_card(), draw_card()]
+            dealer_cards = [draw_card(), draw_card()]
+
+            player_total = hand_value(player_cards)
+            dealer_total = hand_value(dealer_cards)
+
+            # Simple strategy: player hits until 17 or more
+            while player_total < 17:
+                player_cards.append(draw_card())
+                player_total = hand_value(player_cards)
+                if player_total > 21:
+                    break
+
+            # Dealer hits until 17 or more (standard)
+            if player_total <= 21:
+                while dealer_total < 17:
+                    dealer_cards.append(draw_card())
+                    dealer_total = hand_value(dealer_cards)
+
+            result = ""
+            payout = 0.0
+
+            if player_total > 21:
+                result = "💥 You busted and lost your bet."
+            elif dealer_total > 21:
+                result = "🎉 Dealer busted, you win!"
+                payout = amount * 2  # give double what they put in
+            elif player_total > dealer_total:
+                result = "🎉 You win!"
+                payout = amount * 2
+            elif player_total < dealer_total:
+                result = "😢 Dealer wins, you lost your bet."
+            else:
+                result = "🤝 Push! You get your bet back."
+                payout = amount  # refund
+
+            if payout > 0:
+                final_balance = new_balance + payout
+                await update_account_balance(session, int(acc["discord_id"]), final_balance)
+            else:
+                final_balance = new_balance
+
+            player_str = format_hand(player_cards)
+            dealer_str = format_hand(dealer_cards)
+
+            await interaction.followup.send(
+                f"🃏 **Blackjack Results for {interaction.user.mention}**\n"
+                f"**Bet:** {amount:.2f} WeirdCoins\n\n"
+                f"**Your hand:** {player_str}\n"
+                f"**Dealer's hand:** {dealer_str}\n\n"
+                f"{result}\n"
+                f"💰 Your new balance: **{final_balance:.2f} WeirdCoins**."
+            )
+
+    except Exception as e:
+        print("BLACKJACK ERROR:", e)
+        await interaction.followup.send("❌ Internal error during blackjack.")
 
 # ============================================================
 # STARTUP
