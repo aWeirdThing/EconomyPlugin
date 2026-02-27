@@ -75,19 +75,78 @@ async def update_account_balance(session, discord_id: int, new_balance: float):
 
 # ---------------- TARGET PARSER (for admin) ----------------
 def parse_target(target: str):
-    # Discord mention
     if target.startswith("<@") and target.endswith(">"):
         return "discord", int(target.replace("<@", "").replace(">", "").replace("!", ""))
-
-    # Discord ID
     if target.isdigit():
         return "discord", int(target)
-
-    # Minecraft UUID
     if re.match(r"^[0-9a-fA-F-]{32,36}$", target):
         return "mc", target
-
     return None, None
+
+# ---------------- MARKET PAGINATION VIEW ----------------
+class MarketView(discord.ui.View):
+    def __init__(self, listings, per_page: int = 10):
+        super().__init__(timeout=None)  # never times out
+        self.listings = listings
+        self.per_page = per_page
+        self.page = 0
+
+    def max_page(self) -> int:
+        if not self.listings:
+            return 0
+        return (len(self.listings) - 1) // self.per_page
+
+    def page_slice(self):
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return self.listings[start:end]
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="🛒 Marketplace Listings",
+            color=discord.Color.blurple()
+        )
+
+        if not self.listings:
+            embed.description = "📭 Marketplace is empty."
+            return embed
+
+        for row in self.page_slice():
+            line = (
+                f"**#{row['id']}** — {row['amount']}x "
+                f"`{row['item_type']}` for **{row['price']} WeirdCoins**"
+            )
+            embed.add_field(name="\u200b", value=line, inline=False)
+
+        embed.set_footer(
+            text=f"Page {self.page + 1}/{self.max_page() + 1} • {len(self.listings)} total listings"
+        )
+        return embed
+
+    async def _update(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="⏮ First", style=discord.ButtonStyle.secondary, custom_id="market_first")
+    async def first_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = 0
+        await self._update(interaction)
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.primary, custom_id="market_prev")
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+        await self._update(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary, custom_id="market_next")
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.max_page():
+            self.page += 1
+        await self._update(interaction)
+
+    @discord.ui.button(label="Last ⏭", style=discord.ButtonStyle.secondary, custom_id="market_last")
+    async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = self.max_page()
+        await self._update(interaction)
 
 # ============================================================
 # /link CODE — link Discord ↔ Minecraft
@@ -176,7 +235,7 @@ async def balance(interaction: discord.Interaction):
         await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
-# /market — view active listings
+# /market — view active listings (PAGINATED)
 # ============================================================
 @tree.command(name="market", description="View the global marketplace")
 async def market(interaction: discord.Interaction):
@@ -197,14 +256,9 @@ async def market(interaction: discord.Interaction):
             if len(data) == 0:
                 return await interaction.followup.send("📭 Marketplace is empty.")
 
-            msg = "**🛒 Marketplace Listings**\n"
-            for row in data:
-                msg += (
-                    f"**#{row['id']}** — {row['amount']}x "
-                    f"`{row['item_type']}` for **{row['price']} WeirdCoins**\n"
-                )
-
-            await interaction.followup.send(msg)
+            view = MarketView(data, per_page=10)
+            embed = view.build_embed()
+            await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
         print("MARKET ERROR:", e)
@@ -249,14 +303,12 @@ async def buy(interaction: discord.Interaction, listing_id: int):
 
             seller_acc = await get_account_by_mc_uuid(session, listing["seller_mc_uuid"])
 
-            # Update buyer
             await update_account_balance(
                 session,
                 int(buyer_acc["discord_id"]),
                 buyer_balance - total_cost
             )
 
-            # Update seller
             if seller_acc:
                 seller_balance = float(seller_acc.get("balance", 0))
                 await update_account_balance(
@@ -265,7 +317,6 @@ async def buy(interaction: discord.Interaction, listing_id: int):
                     seller_balance + total_cost
                 )
 
-            # Mark sold
             await supabase_patch(
                 session,
                 "marketplace_listings",
@@ -536,7 +587,6 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
 
             receiver_balance = float(receiver_acc.get("balance", 0))
 
-            # Update balances
             await update_account_balance(
                 session,
                 int(sender_acc["discord_id"]),
