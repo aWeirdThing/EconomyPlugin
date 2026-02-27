@@ -2,6 +2,7 @@ import os
 import discord
 from discord.ext import commands
 import aiohttp
+import re
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -9,20 +10,29 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 MARKET_CHANNEL_ID = 1475144850826592267
 
+# ---------------- INTENTS (FIXES /link FREEZE) ----------------
 intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+# ---------------- SAFE JSON PARSER ----------------
+async def safe_json(res):
+    try:
+        return await res.json()
+    except:
+        text = await res.text()
+        return {"error": text}
 
 # ---------------- SUPABASE HELPERS ----------------
 async def supabase_get(session, table, params=""):
     url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}"
-    }
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     async with session.get(url, headers=headers) as res:
-        data = await res.json()
-        return data, res.status
+        return await safe_json(res), res.status
 
 async def supabase_post(session, table, data):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -33,8 +43,7 @@ async def supabase_post(session, table, data):
         "Content-Type": "application/json"
     }
     async with session.post(url, headers=headers, json=data) as res:
-        data = await res.json()
-        return data, res.status
+        return await safe_json(res), res.status
 
 async def supabase_patch(session, table, params, data):
     url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
@@ -44,37 +53,35 @@ async def supabase_patch(session, table, params, data):
         "Content-Type": "application/json"
     }
     async with session.patch(url, headers=headers, json=data) as res:
-        data = await res.json()
-        return data, res.status
+        return await safe_json(res), res.status
 
 # ---------------- ACCOUNT HELPERS ----------------
 async def get_account_by_discord(session, discord_id: int):
-    data, status = await supabase_get(
-        session,
-        "accounts",
-        f"?discord_id=eq.{discord_id}"
-    )
-    if status != 200 or len(data) == 0:
-        return None
-    return data[0]
+    data, status = await supabase_get(session, "accounts", f"?discord_id=eq.{discord_id}")
+    return data[0] if status == 200 and isinstance(data, list) and data else None
 
 async def get_account_by_mc_uuid(session, mc_uuid: str):
-    data, status = await supabase_get(
-        session,
-        "accounts",
-        f"?mc_uuid=eq.{mc_uuid}"
-    )
-    if status != 200 or len(data) == 0:
-        return None
-    return data[0]
+    data, status = await supabase_get(session, "accounts", f"?mc_uuid=eq.{mc_uuid}")
+    return data[0] if status == 200 and isinstance(data, list) and data else None
 
 async def update_account_balance(session, discord_id: int, new_balance: float):
-    await supabase_patch(
-        session,
-        "accounts",
-        f"?discord_id=eq.{discord_id}",
-        {"balance": new_balance}
-    )
+    await supabase_patch(session, "accounts", f"?discord_id=eq.{discord_id}", {"balance": new_balance})
+
+# ---------------- TARGET PARSER (Option C) ----------------
+def parse_target(target: str):
+    # Discord mention
+    if target.startswith("<@") and target.endswith(">"):
+        return "discord", int(target.replace("<@", "").replace(">", "").replace("!", ""))
+
+    # Discord ID
+    if target.isdigit():
+        return "discord", int(target)
+
+    # Minecraft UUID
+    if re.match(r"^[0-9a-fA-F-]{32,36}$", target):
+        return "mc", target
+
+    return None, None
 
 # ============================================================
 # /link CODE — link Discord ↔ Minecraft
@@ -83,50 +90,39 @@ async def update_account_balance(session, discord_id: int, new_balance: float):
 async def link(interaction: discord.Interaction, code: str):
     await interaction.response.defer(thinking=True)
 
-    async with aiohttp.ClientSession() as session:
-        data, status = await supabase_get(
-            session,
-            "link_codes",
-            f"?code=eq.{code}&used=eq.false"
-        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            data, status = await supabase_get(session, "link_codes", f"?code=eq.{code}&used=eq.false")
 
-        if status != 200 or len(data) == 0:
-            return await interaction.followup.send("❌ Invalid or already used link code.")
+            if status != 200 or not isinstance(data, list) or len(data) == 0:
+                return await interaction.followup.send("❌ Invalid or already used link code.")
 
-        entry = data[0]
-        mc_uuid = entry["mc_uuid"]
+            entry = data[0]
+            mc_uuid = entry["mc_uuid"]
 
-        existing = await get_account_by_discord(session, interaction.user.id)
+            existing = await get_account_by_discord(session, interaction.user.id)
 
-        if existing:
-            await supabase_patch(
-                session,
-                "accounts",
-                f"?discord_id=eq.{interaction.user.id}",
-                {"mc_uuid": mc_uuid}
-            )
-        else:
-            account_data = {
-                "mc_uuid": mc_uuid,
-                "discord_id": str(interaction.user.id)
-                # balance uses DB default 100 WeirdCoins
-            }
-            await supabase_post(session, "accounts", account_data)
+            if existing:
+                await supabase_patch(session, "accounts", f"?discord_id=eq.{interaction.user.id}", {"mc_uuid": mc_uuid})
+            else:
+                await supabase_post(session, "accounts", {
+                    "mc_uuid": mc_uuid,
+                    "discord_id": str(interaction.user.id)
+                })
 
-        await supabase_patch(
-            session,
-            "link_codes",
-            f"?code=eq.{code}",
-            {
+            await supabase_patch(session, "link_codes", f"?code=eq.{code}", {
                 "used": True,
                 "discord_id": str(interaction.user.id)
-            }
-        )
+            })
 
-        await interaction.followup.send(
-            f"✅ {interaction.user.mention}, your Discord account is now linked to your Minecraft account!\n"
-            f"You start with **100 WeirdCoins**."
-        )
+            await interaction.followup.send(
+                f"✅ {interaction.user.mention}, your Discord account is now linked!\n"
+                f"You start with **100 WeirdCoins**."
+            )
+
+    except Exception as e:
+        print("LINK ERROR:", e)
+        await interaction.followup.send("❌ Internal error during linking.")
 
 # ============================================================
 # /balance — show WeirdCoins
@@ -135,18 +131,18 @@ async def link(interaction: discord.Interaction, code: str):
 async def balance(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    async with aiohttp.ClientSession() as session:
-        acc = await get_account_by_discord(session, interaction.user.id)
-        if not acc:
-            return await interaction.followup.send(
-                "❌ You are not linked yet.\n"
-                "Run `/link` in Minecraft to get a code, then `/link CODE` here."
-            )
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc:
+                return await interaction.followup.send("❌ You are not linked. Use `/link` in Minecraft first.")
 
-        bal = float(acc.get("balance", 0))
-        await interaction.followup.send(
-            f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**."
-        )
+            bal = float(acc.get("balance", 0))
+            await interaction.followup.send(f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**.")
+
+    except Exception as e:
+        print("BALANCE ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
 # /market — view active listings
@@ -155,27 +151,28 @@ async def balance(interaction: discord.Interaction):
 async def market(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    async with aiohttp.ClientSession() as session:
-        data, status = await supabase_get(
-            session,
-            "marketplace_listings",
-            "?status=eq.active&select=id,item_type,amount,price"
-        )
-
-        if status != 200:
-            return await interaction.followup.send("❌ Failed to load marketplace.")
-
-        if len(data) == 0:
-            return await interaction.followup.send("📭 Marketplace is empty.")
-
-        msg = "**🛒 Marketplace Listings**\n"
-        for row in data:
-            msg += (
-                f"**#{row['id']}** — {row['amount']}x "
-                f"`{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+    try:
+        async with aiohttp.ClientSession() as session:
+            data, status = await supabase_get(
+                session, "marketplace_listings",
+                "?status=eq.active&select=id,item_type,amount,price"
             )
 
-        await interaction.followup.send(msg)
+            if status != 200 or not isinstance(data, list):
+                return await interaction.followup.send("❌ Failed to load marketplace.")
+
+            if len(data) == 0:
+                return await interaction.followup.send("📭 Marketplace is empty.")
+
+            msg = "**🛒 Marketplace Listings**\n"
+            for row in data:
+                msg += f"**#{row['id']}** — {row['amount']}x `{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+
+            await interaction.followup.send(msg)
+
+    except Exception as e:
+        print("MARKET ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
 # /buy ID — buy listing with WeirdCoins
@@ -184,66 +181,63 @@ async def market(interaction: discord.Interaction):
 async def buy(interaction: discord.Interaction, listing_id: int):
     await interaction.response.defer(thinking=True)
 
-    async with aiohttp.ClientSession() as session:
-        data, status = await supabase_get(
-            session,
-            "marketplace_listings",
-            f"?id=eq.{listing_id}"
-        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            data, status = await supabase_get(session, "marketplace_listings", f"?id=eq.{listing_id}")
 
-        if status != 200 or len(data) == 0:
-            return await interaction.followup.send("❌ Listing not found.")
+            if status != 200 or not isinstance(data, list) or len(data) == 0:
+                return await interaction.followup.send("❌ Listing not found.")
 
-        listing = data[0]
+            listing = data[0]
 
-        if listing["status"] != "active":
-            return await interaction.followup.send("❌ This listing is no longer available.")
+            if listing["status"] != "active":
+                return await interaction.followup.send("❌ This listing is no longer available.")
 
-        price = float(listing["price"])
-        amount = int(listing["amount"])
-        total_cost = price * amount
+            price = float(listing["price"])
+            amount = int(listing["amount"])
+            total_cost = price * amount
 
-        buyer_acc = await get_account_by_discord(session, interaction.user.id)
-        if not buyer_acc:
-            return await interaction.followup.send(
-                "❌ You must link your account first using `/link CODE`."
+            buyer_acc = await get_account_by_discord(session, interaction.user.id)
+            if not buyer_acc:
+                return await interaction.followup.send("❌ You must link your account first.")
+
+            buyer_balance = float(buyer_acc.get("balance", 0))
+            if buyer_balance < total_cost:
+                return await interaction.followup.send(
+                    f"❌ You need **{total_cost:.2f}**, but you only have **{buyer_balance:.2f}**."
+                )
+
+            seller_acc = await get_account_by_mc_uuid(session, listing["seller_mc_uuid"])
+
+            # Update buyer
+            await update_account_balance(session, int(buyer_acc["discord_id"]), buyer_balance - total_cost)
+
+            # Update seller
+            if seller_acc:
+                seller_balance = float(seller_acc.get("balance", 0))
+                await update_account_balance(
+                    session,
+                    int(seller_acc["discord_id"]),
+                    seller_balance + total_cost
+                )
+
+            # Mark sold
+            await supabase_patch(
+                session,
+                "marketplace_listings",
+                f"?id=eq.{listing_id}",
+                {"status": "sold", "buyer_mc_uuid": buyer_acc["mc_uuid"]}
             )
 
-        buyer_balance = float(buyer_acc.get("balance", 0))
-        if buyer_balance < total_cost:
-            return await interaction.followup.send(
-                f"❌ Not enough WeirdCoins. You need **{total_cost:.2f}**, "
-                f"but you have **{buyer_balance:.2f}**."
+            await interaction.followup.send(
+                f"✅ {interaction.user.mention} bought **{amount}x {listing['item_type']}** "
+                f"for **{total_cost:.2f} WeirdCoins**.\n"
+                f"It will be delivered next time you join Minecraft or run `/deliver`."
             )
 
-        seller_mc_uuid = listing["seller_mc_uuid"]
-        seller_acc = await get_account_by_mc_uuid(session, seller_mc_uuid)
-
-        new_buyer_balance = buyer_balance - total_cost
-        await update_account_balance(session, int(buyer_acc["discord_id"]), new_buyer_balance)
-
-        if seller_acc:
-            seller_balance = float(seller_acc.get("balance", 0))
-            new_seller_balance = seller_balance + total_cost
-            await update_account_balance(session, int(seller_acc["discord_id"]), new_seller_balance)
-
-        # Mark listing as sold (pulled from sale)
-        await supabase_patch(
-            session,
-            "marketplace_listings",
-            f"?id=eq.{listing_id}",
-            {
-                "status": "sold",
-                "buyer_mc_uuid": buyer_acc["mc_uuid"]
-            }
-        )
-
-        await interaction.followup.send(
-            f"✅ {interaction.user.mention} bought **{amount}x {listing['item_type']}** "
-            f"for **{total_cost:.2f} WeirdCoins**.\n"
-            f"New balance: **{new_buyer_balance:.2f} WeirdCoins**.\n"
-            f"It will be delivered next time you join Minecraft or run `/deliver`."
-        )
+    except Exception as e:
+        print("BUY ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
 # /sell — Discord-side listing
@@ -252,42 +246,112 @@ async def buy(interaction: discord.Interaction, listing_id: int):
 async def sell(interaction: discord.Interaction, item: str, amount: int, price: float):
     await interaction.response.defer(thinking=True)
 
-    async with aiohttp.ClientSession() as session:
-        acc = await get_account_by_discord(session, interaction.user.id)
-        if not acc:
-            return await interaction.followup.send("❌ You must link your account first.")
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc:
+                return await interaction.followup.send("❌ You must link your account first.")
 
-        mc_uuid = acc["mc_uuid"]
+            listing_data = {
+                "seller_mc_uuid": acc["mc_uuid"],
+                "item_type": item.upper(),
+                "amount": amount,
+                "price": price,
+                "status": "active"
+            }
 
-        listing_data = {
-            "seller_mc_uuid": mc_uuid,
-            "item_type": item.upper(),
-            "amount": amount,
-            "price": price,
-            "status": "active"
-        }
+            created, status = await supabase_post(session, "marketplace_listings", listing_data)
 
-        created, status = await supabase_post(session, "marketplace_listings", listing_data)
+            if status != 201:
+                return await interaction.followup.send("❌ Failed to create listing.")
 
-        if status != 201:
-            return await interaction.followup.send("❌ Failed to create listing.")
+            listing_id = created[0]["id"]
 
-        listing_id = created[0]["id"]
+            channel = bot.get_channel(MARKET_CHANNEL_ID)
+            if channel:
+                embed = discord.Embed(title="📦 New Marketplace Listing", color=discord.Color.green())
+                embed.add_field(name="Seller", value=interaction.user.mention, inline=False)
+                embed.add_field(name="Item", value=item.upper(), inline=True)
+                embed.add_field(name="Amount", value=str(amount), inline=True)
+                embed.add_field(name="Price", value=f"{price} WeirdCoins", inline=True)
+                embed.add_field(name="Listing ID", value=str(listing_id), inline=False)
+                await channel.send(embed=embed)
 
-        channel = bot.get_channel(MARKET_CHANNEL_ID)
-        if channel:
-            embed = discord.Embed(title="📦 New Marketplace Listing", color=discord.Color.green())
-            embed.add_field(name="Seller", value=interaction.user.mention, inline=False)
-            embed.add_field(name="Item", value=item.upper(), inline=True)
-            embed.add_field(name="Amount", value=str(amount), inline=True)
-            embed.add_field(name="Price", value=f"{price} WeirdCoins", inline=True)
-            embed.add_field(name="Listing ID", value=str(listing_id), inline=False)
-            await channel.send(embed=embed)
+            await interaction.followup.send(
+                f"📦 Listed **{amount}x {item.upper()}** for **{price} WeirdCoins** "
+                f"as listing **#{listing_id}**."
+            )
 
-        await interaction.followup.send(
-            f"📦 Listed **{amount}x {item.upper()}** for **{price} WeirdCoins** "
-            f"as listing **#{listing_id}**."
-        )
+    except Exception as e:
+        print("SELL ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+@tree.command(name="givemoney", description="Admin: Give WeirdCoins to a user or UUID")
+async def givemoney(interaction: discord.Interaction, target: str, amount: float):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.followup.send("❌ Admins only.")
+
+    try:
+        mode, value = parse_target(target)
+        if mode is None:
+            return await interaction.followup.send("❌ Invalid target. Use @user, Discord ID, or UUID.")
+
+        async with aiohttp.ClientSession() as session:
+            if mode == "discord":
+                acc = await get_account_by_discord(session, value)
+            else:
+                acc = await get_account_by_mc_uuid(session, value)
+
+            if not acc:
+                return await interaction.followup.send("❌ Account not found.")
+
+            new_balance = float(acc["balance"]) + amount
+            await update_account_balance(session, int(acc["discord_id"]), new_balance)
+
+            await interaction.followup.send(
+                f"✅ Added **{amount} WeirdCoins**. New balance: **{new_balance:.2f}**."
+            )
+
+    except Exception as e:
+        print("GIVEMONEY ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+@tree.command(name="removemoney", description="Admin: Remove WeirdCoins from a user or UUID")
+async def removemoney(interaction: discord.Interaction, target: str, amount: float):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.followup.send("❌ Admins only.")
+
+    try:
+        mode, value = parse_target(target)
+        if mode is None:
+            return await interaction.followup.send("❌ Invalid target. Use @user, Discord ID, or UUID.")
+
+        async with aiohttp.ClientSession() as session:
+            if mode == "discord":
+                acc = await get_account_by_discord(session, value)
+            else:
+                acc = await get_account_by_mc_uuid(session, value)
+
+            if not acc:
+                return await interaction.followup.send("❌ Account not found.")
+
+            new_balance = max(0, float(acc["balance"]) - amount)
+            await update_account_balance(session, int(acc["discord_id"]), new_balance)
+
+            await interaction.followup.send(
+                f"✅ Removed **{amount} WeirdCoins**. New balance: **{new_balance:.2f}**."
+            )
+
+    except Exception as e:
+        print("REMOVEMONEY ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
 # STARTUP
