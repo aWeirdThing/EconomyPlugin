@@ -10,7 +10,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 MARKET_CHANNEL_ID = 1475144850826592267
 
-# ---------------- INTENTS (FIXES /link FREEZE) ----------------
+# ---------------- INTENTS ----------------
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -23,7 +23,7 @@ tree = bot.tree
 async def safe_json(res):
     try:
         return await res.json()
-    except:
+    except Exception:
         text = await res.text()
         return {"error": text}
 
@@ -57,7 +57,8 @@ async def supabase_patch(session, table, params, data):
 
 # ---------------- ACCOUNT HELPERS ----------------
 async def get_account_by_discord(session, discord_id: int):
-    data, status = await supabase_get(session, "accounts", f"?discord_id=eq.{discord_id}")
+    discord_id_str = str(discord_id)
+    data, status = await supabase_get(session, "accounts", f"?discord_id=eq.{discord_id_str}")
     return data[0] if status == 200 and isinstance(data, list) and data else None
 
 async def get_account_by_mc_uuid(session, mc_uuid: str):
@@ -65,9 +66,14 @@ async def get_account_by_mc_uuid(session, mc_uuid: str):
     return data[0] if status == 200 and isinstance(data, list) and data else None
 
 async def update_account_balance(session, discord_id: int, new_balance: float):
-    await supabase_patch(session, "accounts", f"?discord_id=eq.{discord_id}", {"balance": new_balance})
+    await supabase_patch(
+        session,
+        "accounts",
+        f"?discord_id=eq.{str(discord_id)}",
+        {"balance": new_balance}
+    )
 
-# ---------------- TARGET PARSER (Option C) ----------------
+# ---------------- TARGET PARSER (for admin) ----------------
 def parse_target(target: str):
     # Discord mention
     if target.startswith("<@") and target.endswith(">"):
@@ -92,9 +98,14 @@ async def link(interaction: discord.Interaction, code: str):
 
     try:
         async with aiohttp.ClientSession() as session:
-            data, status = await supabase_get(session, "link_codes", f"?code=eq.{code}&used=eq.false")
+            data, status = await supabase_get(
+                session,
+                "link_codes",
+                f"?code=eq.{code}&used=eq.false"
+            )
 
             if status != 200 or not isinstance(data, list) or len(data) == 0:
+                print("LINK: no matching code or bad status", status, data)
                 return await interaction.followup.send("❌ Invalid or already used link code.")
 
             entry = data[0]
@@ -103,21 +114,36 @@ async def link(interaction: discord.Interaction, code: str):
             existing = await get_account_by_discord(session, interaction.user.id)
 
             if existing:
-                await supabase_patch(session, "accounts", f"?discord_id=eq.{interaction.user.id}", {"mc_uuid": mc_uuid})
+                await supabase_patch(
+                    session,
+                    "accounts",
+                    f"?discord_id=eq.{str(interaction.user.id)}",
+                    {"mc_uuid": mc_uuid}
+                )
             else:
-                await supabase_post(session, "accounts", {
-                    "mc_uuid": mc_uuid,
-                    "discord_id": str(interaction.user.id)
-                })
+                await supabase_post(
+                    session,
+                    "accounts",
+                    {
+                        "mc_uuid": mc_uuid,
+                        "discord_id": str(interaction.user.id)
+                        # balance uses DB default 100
+                    }
+                )
 
-            await supabase_patch(session, "link_codes", f"?code=eq.{code}", {
-                "used": True,
-                "discord_id": str(interaction.user.id)
-            })
+            await supabase_patch(
+                session,
+                "link_codes",
+                f"?code=eq.{code}",
+                {
+                    "used": True,
+                    "discord_id": str(interaction.user.id)
+                }
+            )
 
             await interaction.followup.send(
                 f"✅ {interaction.user.mention}, your Discord account is now linked!\n"
-                f"You start with **100 WeirdCoins**."
+                f"You start with **100 WeirdCoins** (if this is your first time)."
             )
 
     except Exception as e:
@@ -135,10 +161,15 @@ async def balance(interaction: discord.Interaction):
         async with aiohttp.ClientSession() as session:
             acc = await get_account_by_discord(session, interaction.user.id)
             if not acc:
-                return await interaction.followup.send("❌ You are not linked. Use `/link` in Minecraft first.")
+                return await interaction.followup.send(
+                    "❌ You are not linked.\n"
+                    "Run `/link` in Minecraft to get a code, then `/link CODE` here."
+                )
 
             bal = float(acc.get("balance", 0))
-            await interaction.followup.send(f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**.")
+            await interaction.followup.send(
+                f"💰 {interaction.user.mention}, you have **{bal:.2f} WeirdCoins**."
+            )
 
     except Exception as e:
         print("BALANCE ERROR:", e)
@@ -154,11 +185,13 @@ async def market(interaction: discord.Interaction):
     try:
         async with aiohttp.ClientSession() as session:
             data, status = await supabase_get(
-                session, "marketplace_listings",
+                session,
+                "marketplace_listings",
                 "?status=eq.active&select=id,item_type,amount,price"
             )
 
             if status != 200 or not isinstance(data, list):
+                print("MARKET ERROR DATA:", status, data)
                 return await interaction.followup.send("❌ Failed to load marketplace.")
 
             if len(data) == 0:
@@ -166,7 +199,10 @@ async def market(interaction: discord.Interaction):
 
             msg = "**🛒 Marketplace Listings**\n"
             for row in data:
-                msg += f"**#{row['id']}** — {row['amount']}x `{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+                msg += (
+                    f"**#{row['id']}** — {row['amount']}x "
+                    f"`{row['item_type']}` for **{row['price']} WeirdCoins**\n"
+                )
 
             await interaction.followup.send(msg)
 
@@ -183,7 +219,11 @@ async def buy(interaction: discord.Interaction, listing_id: int):
 
     try:
         async with aiohttp.ClientSession() as session:
-            data, status = await supabase_get(session, "marketplace_listings", f"?id=eq.{listing_id}")
+            data, status = await supabase_get(
+                session,
+                "marketplace_listings",
+                f"?id=eq.{listing_id}"
+            )
 
             if status != 200 or not isinstance(data, list) or len(data) == 0:
                 return await interaction.followup.send("❌ Listing not found.")
@@ -210,7 +250,11 @@ async def buy(interaction: discord.Interaction, listing_id: int):
             seller_acc = await get_account_by_mc_uuid(session, listing["seller_mc_uuid"])
 
             # Update buyer
-            await update_account_balance(session, int(buyer_acc["discord_id"]), buyer_balance - total_cost)
+            await update_account_balance(
+                session,
+                int(buyer_acc["discord_id"]),
+                buyer_balance - total_cost
+            )
 
             # Update seller
             if seller_acc:
@@ -263,6 +307,7 @@ async def sell(interaction: discord.Interaction, item: str, amount: int, price: 
             created, status = await supabase_post(session, "marketplace_listings", listing_data)
 
             if status != 201:
+                print("SELL CREATE ERROR:", status, created)
                 return await interaction.followup.send("❌ Failed to create listing.")
 
             listing_id = created[0]["id"]
@@ -351,6 +396,165 @@ async def removemoney(interaction: discord.Interaction, target: str, amount: flo
 
     except Exception as e:
         print("REMOVEMONEY ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /leaderboard — top balances
+# ============================================================
+@tree.command(name="leaderboard", description="Show the top WeirdCoins holders")
+async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            data, status = await supabase_get(
+                session,
+                "accounts",
+                "?select=discord_id,balance&order=balance.desc&limit=10"
+            )
+
+            if status != 200 or not isinstance(data, list):
+                print("LEADERBOARD ERROR DATA:", status, data)
+                return await interaction.followup.send("❌ Failed to load leaderboard.")
+
+            if len(data) == 0:
+                return await interaction.followup.send("📭 No accounts yet.")
+
+            lines = []
+            rank = 1
+            for row in data:
+                did = row["discord_id"]
+                bal = float(row.get("balance", 0))
+                user = bot.get_user(int(did)) or await bot.fetch_user(int(did))
+                name = user.mention if user else f"`{did}`"
+                lines.append(f"**#{rank}** — {name}: **{bal:.2f} WeirdCoins**")
+                rank += 1
+
+            msg = "**🏆 WeirdCoins Leaderboard**\n" + "\n".join(lines)
+            await interaction.followup.send(msg)
+
+    except Exception as e:
+        print("LEADERBOARD ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /profile — show your account info
+# ============================================================
+@tree.command(name="profile", description="Show your WeirdCoins profile")
+async def profile(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc:
+                return await interaction.followup.send(
+                    "❌ You are not linked.\n"
+                    "Run `/link` in Minecraft to get a code, then `/link CODE` here."
+                )
+
+            bal = float(acc.get("balance", 0))
+            mc_uuid = acc.get("mc_uuid", "Not linked to Minecraft")
+
+            embed = discord.Embed(
+                title=f"{interaction.user.name}'s Profile",
+                color=discord.Color.gold()
+            )
+            embed.add_field(name="WeirdCoins", value=f"**{bal:.2f}**", inline=False)
+            embed.add_field(name="Minecraft UUID", value=f"`{mc_uuid}`", inline=False)
+
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print("PROFILE ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /richest — show the single richest player
+# ============================================================
+@tree.command(name="richest", description="Show the richest WeirdCoins holder")
+async def richest(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            data, status = await supabase_get(
+                session,
+                "accounts",
+                "?select=discord_id,balance&order=balance.desc&limit=1"
+            )
+
+            if status != 200 or not isinstance(data, list):
+                print("RICHEST ERROR DATA:", status, data)
+                return await interaction.followup.send("❌ Failed to load richest player.")
+
+            if len(data) == 0:
+                return await interaction.followup.send("📭 No accounts yet.")
+
+            row = data[0]
+            did = row["discord_id"]
+            bal = float(row.get("balance", 0))
+            user = bot.get_user(int(did)) or await bot.fetch_user(int(did))
+            name = user.mention if user else f"`{did}`"
+
+            await interaction.followup.send(
+                f"👑 Richest player: {name} with **{bal:.2f} WeirdCoins**."
+            )
+
+    except Exception as e:
+        print("RICHEST ERROR:", e)
+        await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /transfer — send WeirdCoins to another player
+# ============================================================
+@tree.command(name="transfer", description="Send WeirdCoins to another player")
+async def transfer(interaction: discord.Interaction, target: discord.User, amount: float):
+    await interaction.response.defer(thinking=True)
+
+    if target.id == interaction.user.id:
+        return await interaction.followup.send("❌ You can't transfer to yourself.")
+
+    if amount <= 0:
+        return await interaction.followup.send("❌ Amount must be positive.")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            sender_acc = await get_account_by_discord(session, interaction.user.id)
+            if not sender_acc:
+                return await interaction.followup.send("❌ You are not linked.")
+
+            receiver_acc = await get_account_by_discord(session, target.id)
+            if not receiver_acc:
+                return await interaction.followup.send("❌ Target user is not linked.")
+
+            sender_balance = float(sender_acc.get("balance", 0))
+            if sender_balance < amount:
+                return await interaction.followup.send(
+                    f"❌ You don't have enough WeirdCoins. You have **{sender_balance:.2f}**."
+                )
+
+            receiver_balance = float(receiver_acc.get("balance", 0))
+
+            # Update balances
+            await update_account_balance(
+                session,
+                int(sender_acc["discord_id"]),
+                sender_balance - amount
+            )
+            await update_account_balance(
+                session,
+                int(receiver_acc["discord_id"]),
+                receiver_balance + amount
+            )
+
+            await interaction.followup.send(
+                f"✅ {interaction.user.mention} sent **{amount:.2f} WeirdCoins** to {target.mention}.\n"
+                f"Your new balance: **{sender_balance - amount:.2f} WeirdCoins**."
+            )
+
+    except Exception as e:
+        print("TRANSFER ERROR:", e)
         await interaction.followup.send("❌ Internal error.")
 
 # ============================================================
