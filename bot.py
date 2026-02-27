@@ -295,6 +295,10 @@ async def buy(interaction: discord.Interaction, listing_id: int):
             if not buyer_acc:
                 return await interaction.followup.send("❌ You must link your account first.")
 
+            # Prevent buying your own listing (compare Minecraft UUIDs)
+            if buyer_acc.get("mc_uuid") == listing.get("seller_mc_uuid"):
+                return await interaction.followup.send("❌ You cannot buy your own listing.")
+
             buyer_balance = float(buyer_acc.get("balance", 0))
             if buyer_balance < total_cost:
                 return await interaction.followup.send(
@@ -303,12 +307,14 @@ async def buy(interaction: discord.Interaction, listing_id: int):
 
             seller_acc = await get_account_by_mc_uuid(session, listing["seller_mc_uuid"])
 
+            # Deduct from buyer
             await update_account_balance(
                 session,
                 int(buyer_acc["discord_id"]),
                 buyer_balance - total_cost
             )
 
+            # Pay seller if they have an account
             if seller_acc:
                 seller_balance = float(seller_acc.get("balance", 0))
                 await update_account_balance(
@@ -317,6 +323,7 @@ async def buy(interaction: discord.Interaction, listing_id: int):
                     seller_balance + total_cost
                 )
 
+            # Mark sold
             await supabase_patch(
                 session,
                 "marketplace_listings",
