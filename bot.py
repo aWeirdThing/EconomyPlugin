@@ -149,6 +149,71 @@ class MarketView(discord.ui.View):
         self.page = self.max_page()
         await self._update(interaction)
 
+# ---------------- SOLD LISTINGS PAGINATION VIEW ----------------
+class SoldMarketView(discord.ui.View):
+    def __init__(self, listings, per_page: int = 10):
+        super().__init__(timeout=None)
+        self.listings = listings
+        self.per_page = per_page
+        self.page = 0
+
+    def max_page(self) -> int:
+        if not self.listings:
+            return 0
+        return (len(self.listings) - 1) // self.per_page
+
+    def page_slice(self):
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return self.listings[start:end]
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="🧾 Sold Marketplace Listings",
+            color=discord.Color.dark_gray()
+        )
+
+        if not self.listings:
+            embed.description = "📭 No sold listings yet."
+            return embed
+
+        for row in self.page_slice():
+            line = (
+                f"**#{row['id']}** — {row['amount']}x "
+                f"`{row['item_type']}` sold for **{row['price']} WeirdCoins**"
+            )
+            embed.add_field(name="\u200b", value=line, inline=False)
+
+        embed.set_footer(
+            text=f"Page {self.page + 1}/{self.max_page() + 1} • {len(self.listings)} total sold listings"
+        )
+        return embed
+
+    async def _update(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="⏮ First", style=discord.ButtonStyle.secondary, custom_id="sold_first")
+    async def first_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = 0
+        await self._update(interaction)
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.primary, custom_id="sold_prev")
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+        await self._update(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary, custom_id="sold_next")
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.max_page():
+            self.page += 1
+        await self._update(interaction)
+
+    @discord.ui.button(label="Last ⏭", style=discord.ButtonStyle.secondary, custom_id="sold_last")
+    async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = self.max_page()
+        await self._update(interaction)
+
 # ---------------- BLACKJACK HELPERS ----------------
 CARD_VALUES = {
     "2": 2, "3": 3, "4": 4, "5": 5, "6": 6,
@@ -285,6 +350,37 @@ async def market(interaction: discord.Interaction):
     except Exception as e:
         print("MARKET ERROR:", e)
         await interaction.followup.send("❌ Internal error.")
+
+# ============================================================
+# /soldlistings — view sold listings (PAGINATED, GLOBAL)
+# ============================================================
+@tree.command(name="soldlistings", description="View all sold marketplace listings")
+async def soldlistings(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # All listings where status = 'sold'
+            data, status = await supabase_get(
+                session,
+                "marketplace_listings",
+                "?status=eq.sold&select=id,item_type,amount,price"
+            )
+
+            if status != 200 or not isinstance(data, list):
+                print("SOLDLISTINGS ERROR DATA:", status, data)
+                return await interaction.followup.send("❌ Failed to load sold listings.")
+
+            if len(data) == 0:
+                return await interaction.followup.send("📭 No sold listings yet.")
+
+            view = SoldMarketView(data, per_page=10)
+            embed = view.build_embed()
+            await interaction.followup.send(embed=embed, view=view)
+
+    except Exception as e:
+        print("SOLDLISTINGS ERROR:", e)
+        await interaction.followup.send("❌ Internal error while loading sold listings.")
 
 # ============================================================
 # /buy ID — buy listing with WeirdCoins
