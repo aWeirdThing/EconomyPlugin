@@ -10,6 +10,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 MARKET_CHANNEL_ID = 1475144850826592267
+FACTION_CHANNEL_ID = 1477655105913229435  # <--- faction status embed channel
 
 # ---------------- INTENTS ----------------
 intents = discord.Intents.default()
@@ -360,7 +361,6 @@ async def soldlistings(interaction: discord.Interaction):
 
     try:
         async with aiohttp.ClientSession() as session:
-            # All listings where status = 'sold'
             data, status = await supabase_get(
                 session,
                 "marketplace_listings",
@@ -750,71 +750,497 @@ async def blackjack(interaction: discord.Interaction, amount: float):
                     f"❌ You don't have enough WeirdCoins. You have **{balance:.2f}**."
                 )
 
-            new_balance = balance - amount
-            await update_account_balance(session, int(acc["discord_id"]), new_balance)
-
+            # Deal initial hands
             player_cards = [draw_card(), draw_card()]
             dealer_cards = [draw_card(), draw_card()]
+
+            # Simple auto-play: player hits until 17 or more
+            while hand_value(player_cards) < 17:
+                player_cards.append(draw_card())
+
+            # Dealer hits until 17 or more
+            while hand_value(dealer_cards) < 17:
+                dealer_cards.append(draw_card())
 
             player_total = hand_value(player_cards)
             dealer_total = hand_value(dealer_cards)
 
-            while player_total < 17:
-                player_cards.append(draw_card())
-                player_total = hand_value(player_cards)
-                if player_total > 21:
-                    break
-
-            if player_total <= 21:
-                while dealer_total < 17:
-                    dealer_cards.append(draw_card())
-                    dealer_total = hand_value(dealer_cards)
-
             result = ""
-            payout = 0.0
+            delta = 0.0
 
             if player_total > 21:
                 result = "💥 You busted and lost your bet."
+                delta = -amount
             elif dealer_total > 21:
                 result = "🎉 Dealer busted, you win!"
-                payout = amount * 2
+                delta = amount
             elif player_total > dealer_total:
                 result = "🎉 You win!"
-                payout = amount * 2
+                delta = amount
             elif player_total < dealer_total:
-                result = "😢 Dealer wins, you lost your bet."
+                result = "😢 You lose."
+                delta = -amount
             else:
-                result = "🤝 Push! You get your bet back."
-                payout = amount
+                result = "🤝 It's a tie. Your bet is returned."
+                delta = 0.0
 
-            if payout > 0:
-                final_balance = new_balance + payout
-                await update_account_balance(session, int(acc["discord_id"]), final_balance)
-            else:
-                final_balance = new_balance
+            new_balance = balance + delta
+            await update_account_balance(session, int(acc["discord_id"]), new_balance)
 
-            player_str = format_hand(player_cards)
-            dealer_str = format_hand(dealer_cards)
-
-            await interaction.followup.send(
-                f"🃏 **Blackjack Results for {interaction.user.mention}**\n"
-                f"**Bet:** {amount:.2f} WeirdCoins\n\n"
-                f"**Your hand:** {player_str}\n"
-                f"**Dealer's hand:** {dealer_str}\n\n"
+            msg = (
+                f"🃏 **Blackjack Result**\n"
+                f"**Your hand:** {format_hand(player_cards)}\n"
+                f"**Dealer's hand:** {format_hand(dealer_cards)}\n\n"
                 f"{result}\n"
-                f"💰 Your new balance: **{final_balance:.2f} WeirdCoins**."
+                f"💰 New balance: **{new_balance:.2f} WeirdCoins**."
             )
+            await interaction.followup.send(msg)
 
     except Exception as e:
         print("BLACKJACK ERROR:", e)
-        await interaction.followup.send("❌ Internal error during blackjack.")
+        await interaction.followup.send("❌ Internal error.")
+
+# --------------- PART 1 END (NEXT: FACTION LOGIC) ---------------
+# ============================================================
+# EXTRA SUPABASE HELPER FOR DELETE
+# ============================================================
+async def supabase_delete(session, table, params):
+    url = f"{SUPABASE_URL}/rest/v1/{table}{params}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+    async with session.delete(url, headers=headers) as res:
+        return await safe_json(res), res.status
+
 
 # ============================================================
-# STARTUP
+# FACTION CONSTANTS
+# ============================================================
+FACTION_STATUS_CHANNEL_ID = FACTION_CHANNEL_ID  # reuse constant you gave
+FACTION_EMBED_MESSAGE_ID = int(os.getenv("FACTION_EMBED_MESSAGE_ID", "0"))  # pre-existing embed
+
+
+# ============================================================
+# FACTION HELPERS
+# ============================================================
+async def get_faction_by_name(session, name: str):
+    data, status = await supabase_get(
+        session,
+        "factions",
+        f"?name=eq.{name}"
+    )
+    if status == 200 and isinstance(data, list) and data:
+        return data[0]
+    return None
+
+
+async def get_faction_by_id(session, faction_id: str):
+    data, status = await supabase_get(
+        session,
+        "factions",
+        f"?id=eq.{faction_id}"
+    )
+    if status == 200 and isinstance(data, list) and data:
+        return data[0]
+    return None
+
+
+async def get_player_faction(session, mc_uuid: str):
+    # find faction_members row, then faction
+    data, status = await supabase_get(
+        session,
+        "faction_members",
+        f"?player_uuid=eq.{mc_uuid}"
+    )
+    if status != 200 or not isinstance(data, list) or not data:
+        return None, None
+
+    member_row = data[0]
+    faction_id = member_row["faction_id"]
+    faction = await get_faction_by_id(session, faction_id)
+    return faction, member_row
+
+
+async def get_faction_members(session, faction_id: str):
+    data, status = await supabase_get(
+        session,
+        "faction_members",
+        f"?faction_id=eq.{faction_id}"
+    )
+    if status == 200 and isinstance(data, list):
+        return data
+    return []
+
+
+async def update_faction_member_count(session, faction_id: str):
+    members = await get_faction_members(session, faction_id)
+    count = len(members)
+    await supabase_patch(
+        session,
+        "factions",
+        f"?id=eq.{faction_id}",
+        {"member_count": count}
+    )
+    return count
+
+
+async def build_faction_status_embed(session):
+    # Build a global embed listing all factions and their members
+    data, status = await supabase_get(
+        session,
+        "factions",
+        "?select=id,name,creator_uuid,created_at,member_count&order=created_at.asc"
+    )
+
+    embed = discord.Embed(
+        title="🏰 Factions Overview",
+        description="All active factions and their members.",
+        color=discord.Color.purple()
+    )
+
+    if status != 200 or not isinstance(data, list) or len(data) == 0:
+        embed.description = "No factions created yet."
+        return embed
+
+    for faction in data:
+        faction_id = faction["id"]
+        name = faction["name"]
+        creator_uuid = faction["creator_uuid"]
+        created_at = faction["created_at"]
+        member_count = faction.get("member_count", 0)
+
+        members = await get_faction_members(session, faction_id)
+        member_list = ", ".join(m["player_uuid"][:8] for m in members) if members else "No members yet"
+
+        value = (
+            f"**Creator UUID:** `{creator_uuid}`\n"
+            f"**Created:** `{created_at}`\n"
+            f"**Members ({member_count}):** {member_list}"
+        )
+        embed.add_field(name=f"🏳️ {name}", value=value, inline=False)
+
+    return embed
+
+
+async def refresh_faction_embed(session):
+    if FACTION_EMBED_MESSAGE_ID == 0:
+        return  # not configured, silently skip
+
+    channel = bot.get_channel(FACTION_STATUS_CHANNEL_ID)
+    if channel is None:
+        return
+
+    try:
+        message = await channel.fetch_message(FACTION_EMBED_MESSAGE_ID)
+    except Exception as e:
+        print("FACTION EMBED FETCH ERROR:", e)
+        return
+
+    embed = await build_faction_status_embed(session)
+    try:
+        await message.edit(embed=embed)
+    except Exception as e:
+        print("FACTION EMBED EDIT ERROR:", e)
+
+
+# ============================================================
+# DISCORD-SIDE FACTION COMMANDS
+# These mirror the Minecraft-side logic but operate via Supabase
+# ============================================================
+
+@tree.command(name="faction_create", description="Create a new faction (linked to your Minecraft UUID)")
+async def faction_create(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+
+    name = name.strip()
+    if len(name) < 3 or len(name) > 16:
+        return await interaction.followup.send("❌ Faction name must be between 3 and 16 characters.")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc or not acc.get("mc_uuid"):
+                return await interaction.followup.send(
+                    "❌ You are not linked to a Minecraft account. Use `/link` first."
+                )
+
+            mc_uuid = acc["mc_uuid"]
+
+            # Check if player already in a faction
+            existing_faction, _ = await get_player_faction(session, mc_uuid)
+            if existing_faction:
+                return await interaction.followup.send("❌ You are already in a faction. Leave it first.")
+
+            # Check if faction name already exists
+            existing_by_name = await get_faction_by_name(session, name)
+            if existing_by_name:
+                return await interaction.followup.send("❌ A faction with that name already exists.")
+
+            # Create faction
+            faction_data = {
+                "name": name,
+                "creator_uuid": mc_uuid,
+                "member_count": 0  # will be updated after adding member
+            }
+            created, status = await supabase_post(session, "factions", faction_data)
+            if status != 201 or not isinstance(created, list) or not created:
+                print("FACTION CREATE ERROR:", status, created)
+                return await interaction.followup.send("❌ Failed to create faction in database.")
+
+            faction = created[0]
+            faction_id = faction["id"]
+
+            # Add creator as first member
+            member_data = {
+                "faction_id": faction_id,
+                "player_uuid": mc_uuid
+            }
+            m_created, m_status = await supabase_post(session, "faction_members", member_data)
+            if m_status != 201:
+                print("FACTION MEMBER CREATE ERROR:", m_status, m_created)
+                return await interaction.followup.send(
+                    "❌ Faction created but failed to add you as a member. Contact an admin."
+                )
+
+            # Update member count
+            count = await update_faction_member_count(session, faction_id)
+
+            # Refresh Discord embed
+            await refresh_faction_embed(session)
+
+            await interaction.followup.send(
+                f"🏰 Faction **{name}** created!\n"
+                f"You are the leader. Members: **{count}**."
+            )
+
+    except Exception as e:
+        print("FACTION_CREATE ERROR:", e)
+        await interaction.followup.send("❌ Internal error while creating faction.")
+
+
+@tree.command(name="faction_join", description="Join an existing faction (by name)")
+async def faction_join(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+
+    name = name.strip()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc or not acc.get("mc_uuid"):
+                return await interaction.followup.send(
+                    "❌ You are not linked to a Minecraft account. Use `/link` first."
+                )
+
+            mc_uuid = acc["mc_uuid"]
+
+            # Check if already in a faction
+            existing_faction, _ = await get_player_faction(session, mc_uuid)
+            if existing_faction:
+                return await interaction.followup.send("❌ You are already in a faction. Leave it first.")
+
+            faction = await get_faction_by_name(session, name)
+            if not faction:
+                return await interaction.followup.send("❌ No faction with that name exists.")
+
+            faction_id = faction["id"]
+
+            member_data = {
+                "faction_id": faction_id,
+                "player_uuid": mc_uuid
+            }
+            created, status = await supabase_post(session, "faction_members", member_data)
+            if status != 201:
+                print("FACTION JOIN ERROR:", status, created)
+                return await interaction.followup.send("❌ Failed to join faction (database error).")
+
+            count = await update_faction_member_count(session, faction_id)
+            await refresh_faction_embed(session)
+
+            await interaction.followup.send(
+                f"✅ You joined faction **{faction['name']}**.\n"
+                f"Current members: **{count}**."
+            )
+
+    except Exception as e:
+        print("FACTION_JOIN ERROR:", e)
+        await interaction.followup.send("❌ Internal error while joining faction.")
+
+
+@tree.command(name="faction_details", description="Show details about your current faction")
+async def faction_details(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc or not acc.get("mc_uuid"):
+                return await interaction.followup.send(
+                    "❌ You are not linked to a Minecraft account. Use `/link` first."
+                )
+
+            mc_uuid = acc["mc_uuid"]
+
+            faction, member_row = await get_player_faction(session, mc_uuid)
+            if not faction:
+                return await interaction.followup.send("❌ You are not in a faction.")
+
+            faction_id = faction["id"]
+            members = await get_faction_members(session, faction_id)
+            member_count = len(members)
+
+            creator_uuid = faction["creator_uuid"]
+            created_at = faction["created_at"]
+            name = faction["name"]
+
+            embed = discord.Embed(
+                title=f"🏰 Faction: {name}",
+                color=discord.Color.purple()
+            )
+            embed.add_field(name="Creator UUID", value=f"`{creator_uuid}`", inline=False)
+            embed.add_field(name="Created At", value=f"`{created_at}`", inline=False)
+            embed.add_field(name="Members", value=str(member_count), inline=False)
+
+            member_lines = []
+            for m in members:
+                uuid_short = m["player_uuid"][:8]
+                member_lines.append(f"- `{uuid_short}`")
+
+            if member_lines:
+                embed.add_field(
+                    name="Member UUIDs (shortened)",
+                    value="\n".join(member_lines),
+                    inline=False
+                )
+
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print("FACTION_DETAILS ERROR:", e)
+        await interaction.followup.send("❌ Internal error while loading faction details.")
+
+
+@tree.command(name="faction_leave", description="Leave your current faction")
+async def faction_leave(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc or not acc.get("mc_uuid"):
+                return await interaction.followup.send(
+                    "❌ You are not linked to a Minecraft account. Use `/link` first."
+                )
+
+            mc_uuid = acc["mc_uuid"]
+
+            faction, member_row = await get_player_faction(session, mc_uuid)
+            if not faction or not member_row:
+                return await interaction.followup.send("❌ You are not in a faction.")
+
+            faction_id = faction["id"]
+
+            # Prevent leader from leaving without disbanding
+            if faction["creator_uuid"] == mc_uuid:
+                return await interaction.followup.send(
+                    "❌ You are the faction leader. Use `/faction_disband` instead."
+                )
+
+            # Remove membership
+            _, status = await supabase_delete(
+                session,
+                "faction_members",
+                f"?faction_id=eq.{faction_id}&player_uuid=eq.{mc_uuid}"
+            )
+            if status not in (200, 204):
+                return await interaction.followup.send("❌ Failed to leave faction (database error).")
+
+            count = await update_faction_member_count(session, faction_id)
+            await refresh_faction_embed(session)
+
+            await interaction.followup.send(
+                f"✅ You left faction **{faction['name']}**.\n"
+                f"Remaining members: **{count}**."
+            )
+
+    except Exception as e:
+        print("FACTION_LEAVE ERROR:", e)
+        await interaction.followup.send("❌ Internal error while leaving faction.")
+
+
+@tree.command(name="faction_disband", description="Disband your faction (leader only)")
+async def faction_disband(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await get_account_by_discord(session, interaction.user.id)
+            if not acc or not acc.get("mc_uuid"):
+                return await interaction.followup.send(
+                    "❌ You are not linked to a Minecraft account. Use `/link` first."
+                )
+
+            mc_uuid = acc["mc_uuid"]
+
+            faction, member_row = await get_player_faction(session, mc_uuid)
+            if not faction:
+                return await interaction.followup.send("❌ You are not in a faction.")
+
+            if faction["creator_uuid"] != mc_uuid:
+                return await interaction.followup.send("❌ Only the faction creator can disband the faction.")
+
+            faction_id = faction["id"]
+
+            # Delete all members first (ON DELETE CASCADE could also handle this)
+            _, m_status = await supabase_delete(
+                session,
+                "faction_members",
+                f"?faction_id=eq.{faction_id}"
+            )
+            if m_status not in (200, 204):
+                print("FACTION DISBAND MEMBER DELETE ERROR:", m_status)
+
+            # Delete faction
+            _, f_status = await supabase_delete(
+                session,
+                "factions",
+                f"?id=eq.{faction_id}"
+            )
+            if f_status not in (200, 204):
+                return await interaction.followup.send("❌ Failed to disband faction (database error).")
+
+            await refresh_faction_embed(session)
+
+            await interaction.followup.send(
+                f"💥 Faction **{faction['name']}** has been disbanded."
+            )
+
+    except Exception as e:
+        print("FACTION_DISBAND ERROR:", e)
+        await interaction.followup.send("❌ Internal error while disbanding faction.")
+
+
+# ============================================================
+# BOT STARTUP
 # ============================================================
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"✅ Bot online as {bot.user}")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        synced = await tree.sync()
+        print(f"Synced {len(synced)} application commands.")
+    except Exception as e:
+        print("COMMAND SYNC ERROR:", e)
 
-bot.run(DISCORD_TOKEN)
+    # Optionally refresh faction embed on startup
+    try:
+        async with aiohttp.ClientSession() as session:
+            await refresh_faction_embed(session)
+    except Exception as e:
+        print("FACTION EMBED STARTUP REFRESH ERROR:", e)
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
