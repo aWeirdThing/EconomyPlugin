@@ -1222,20 +1222,13 @@ async def faction_disband(interaction: discord.Interaction):
         await interaction.followup.send("❌ Internal error while disbanding faction.")
 
 
-import os
-import asyncio
+# -------------------------------
+# FASTAPI + DISCORD BOT RUNNER
+# -------------------------------
 import uvicorn
 from fastapi import FastAPI
-import discord
+import asyncio
 
-# Your existing bot instance
-# If your bot variable is named differently, change this:
-bot = bot  # <-- keep your existing bot object
-
-# Channel where new messages will be posted
-CHANNEL_ID = 1479230202809815183  # replace with your channel ID
-
-# FastAPI app
 app = FastAPI()
 
 @app.get("/refresh")
@@ -1245,24 +1238,31 @@ async def refresh():
     return {"status": "ok"}
 
 async def send_faction_update():
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = bot.get_channel(FACTION_CHANNEL_ID)
     if channel is None:
-        print("Channel not found!")
+        print("Faction channel not found!")
         return
-
     await channel.send("A faction event occurred! (Created/Joined/Left/War/etc)")
 
 async def start_fastapi():
     port = int(os.environ.get("PORT", 8000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
     server = uvicorn.Server(config)
     await server.serve()
 
-async def run_all():
+async def main():
     await asyncio.gather(
-        bot.start(os.getenv("DISCORD_TOKEN")),
+        bot.start(DISCORD_TOKEN),
         start_fastapi()
     )
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 # Only run this if this file is the main entry point
 if __name__ == "__main__":
@@ -1291,4 +1291,5 @@ async def on_ready():
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
 
