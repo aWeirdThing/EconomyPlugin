@@ -4,6 +4,25 @@ from discord.ext import commands
 import aiohttp
 import re
 import random
+from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI()
+
+@app.get("/refresh")
+async def refresh_factions():
+    # Call your Discord bot logic here
+    # Example: update an embed, reload data, etc.
+    print("Received refresh request from Minecraft server")
+    await update_faction_embed()
+    return {"status": "ok"}
+
+async def update_faction_embed():
+    # Your Discord bot logic here
+    pass
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -1244,3 +1263,4 @@ async def on_ready():
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
