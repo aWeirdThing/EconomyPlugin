@@ -2,3 +2,5 @@ discord.py
 aiohttp
 python-dotenv
 pytz
+FastAPI
+uvicorn
