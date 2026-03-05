@@ -1234,11 +1234,13 @@ app = FastAPI()
 @app.get("/refresh")
 async def refresh():
     print("Minecraft triggered refresh")
+    await bot.wait_until_ready()
     await send_faction_update()
     return {"status": "ok"}
 
 async def send_faction_update():
     channel = bot.get_channel(FACTION_CHANNEL_ID)
+    print("Channel:", channel)  # Debug
     if channel is None:
         print("Faction channel not found!")
         return
@@ -1263,33 +1265,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# Only run this if this file is the main entry point
-if __name__ == "__main__":
-    asyncio.run(run_all())
-
-
-# ============================================================
-# BOT STARTUP
-# ============================================================
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} application commands.")
-    except Exception as e:
-        print("COMMAND SYNC ERROR:", e)
-
-    # Optionally refresh faction embed on startup
-    try:
-        async with aiohttp.ClientSession() as session:
-            await refresh_faction_embed(session)
-    except Exception as e:
-        print("FACTION EMBED STARTUP REFRESH ERROR:", e)
-
-
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
-
-
