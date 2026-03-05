@@ -4,25 +4,6 @@ from discord.ext import commands
 import aiohttp
 import re
 import random
-from fastapi import FastAPI
-import uvicorn
-
-app = FastAPI()
-
-@app.get("/refresh")
-async def refresh_factions():
-    # Call your Discord bot logic here
-    # Example: update an embed, reload data, etc.
-    print("Received refresh request from Minecraft server")
-    await update_faction_embed()
-    return {"status": "ok"}
-
-async def update_faction_embed():
-    # Your Discord bot logic here
-    pass
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -1239,6 +1220,53 @@ async def faction_disband(interaction: discord.Interaction):
     except Exception as e:
         print("FACTION_DISBAND ERROR:", e)
         await interaction.followup.send("❌ Internal error while disbanding faction.")
+
+
+import os
+import asyncio
+import uvicorn
+from fastapi import FastAPI
+import discord
+
+# Your existing bot instance
+# If your bot variable is named differently, change this:
+bot = bot  # <-- keep your existing bot object
+
+# Channel where new messages will be posted
+CHANNEL_ID = 1479230202809815183  # replace with your channel ID
+
+# FastAPI app
+app = FastAPI()
+
+@app.get("/refresh")
+async def refresh():
+    print("Minecraft triggered refresh")
+    await send_faction_update()
+    return {"status": "ok"}
+
+async def send_faction_update():
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        print("Channel not found!")
+        return
+
+    await channel.send("A faction event occurred! (Created/Joined/Left/War/etc)")
+
+async def start_fastapi():
+    port = int(os.environ.get("PORT", 8000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def run_all():
+    await asyncio.gather(
+        bot.start(os.getenv("DISCORD_TOKEN")),
+        start_fastapi()
+    )
+
+# Only run this if this file is the main entry point
+if __name__ == "__main__":
+    asyncio.run(run_all())
 
 
 # ============================================================
