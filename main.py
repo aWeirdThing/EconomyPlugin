@@ -1206,55 +1206,16 @@ async def on_ready():
     except Exception as e:
         print("COMMAND SYNC ERROR:", e)
 
+    # Optional: refresh faction embed on startup
     try:
         async with aiohttp.ClientSession() as session:
             await refresh_faction_embed(session)
     except Exception as e:
         print("FACTION EMBED STARTUP REFRESH ERROR:", e)
 
-import os
-import discord
-from discord.ext import commands
-from discord import app_commands
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
-# -------------------------------
-# BOT STARTUP
-# -------------------------------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print("Slash command sync error:", e)
-
-# -------------------------------
-# TEST COMMAND
-# -------------------------------
-@tree.command(name="ping", description="Test command")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
-
-# -------------------------------
-# EXAMPLE COMMAND
-# -------------------------------
-@tree.command(name="hello", description="Say hello")
-async def hello(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Hello {interaction.user.mention}!")
-
-# -------------------------------
-# RUN BOT
-# -------------------------------
-bot.run(DISCORD_TOKEN)
+# ============================================================
+# RUN BOT (NORMAL DISCORD BOT, NO FASTAPI)
+# ============================================================
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
