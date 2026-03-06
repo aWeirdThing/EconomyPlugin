@@ -1222,6 +1222,26 @@ async def faction_disband(interaction: discord.Interaction):
         await interaction.followup.send("❌ Internal error while disbanding faction.")
 
 
+# ============================================================
+# BOT STARTUP EVENT
+# ============================================================
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        synced = await tree.sync()
+        print(f"Synced {len(synced)} application commands.")
+    except Exception as e:
+        print("COMMAND SYNC ERROR:", e)
+
+    # Optional: refresh faction embed on startup
+    try:
+        async with aiohttp.ClientSession() as session:
+            await refresh_faction_embed(session)
+    except Exception as e:
+        print("FACTION EMBED STARTUP REFRESH ERROR:", e)
+
+
 # -------------------------------
 # FASTAPI + DISCORD BOT RUNNER
 # -------------------------------
