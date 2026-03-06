@@ -4,13 +4,18 @@ from discord.ext import commands
 import aiohttp
 import re
 import random
+from fastapi import FastAPI, Request
+import uvicorn
+import asyncio
+from datetime import datetime
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 MARKET_CHANNEL_ID = 1475144850826592267
-FACTION_CHANNEL_ID = 1477655105913229435  # <--- faction status embed channel
+FACTION_CHANNEL_ID = 1477655105913229435  # faction status embed channel
+MC_EVENT_CHANNEL = 1479230202809815183    # MC event log channel
 
 # ---------------- INTENTS ----------------
 intents = discord.Intents.default()
@@ -750,15 +755,12 @@ async def blackjack(interaction: discord.Interaction, amount: float):
                     f"❌ You don't have enough WeirdCoins. You have **{balance:.2f}**."
                 )
 
-            # Deal initial hands
             player_cards = [draw_card(), draw_card()]
             dealer_cards = [draw_card(), draw_card()]
 
-            # Simple auto-play: player hits until 17 or more
             while hand_value(player_cards) < 17:
                 player_cards.append(draw_card())
 
-            # Dealer hits until 17 or more
             while hand_value(dealer_cards) < 17:
                 dealer_cards.append(draw_card())
 
@@ -814,13 +816,11 @@ async def supabase_delete(session, table, params):
     async with session.delete(url, headers=headers) as res:
         return await safe_json(res), res.status
 
-
 # ============================================================
 # FACTION CONSTANTS
 # ============================================================
-FACTION_STATUS_CHANNEL_ID = FACTION_CHANNEL_ID  # reuse constant you gave
-FACTION_EMBED_MESSAGE_ID = int(os.getenv("FACTION_EMBED_MESSAGE_ID", "0"))  # pre-existing embed
-
+FACTION_STATUS_CHANNEL_ID = FACTION_CHANNEL_ID
+FACTION_EMBED_MESSAGE_ID = int(os.getenv("FACTION_EMBED_MESSAGE_ID", "0"))
 
 # ============================================================
 # FACTION HELPERS
@@ -835,7 +835,6 @@ async def get_faction_by_name(session, name: str):
         return data[0]
     return None
 
-
 async def get_faction_by_id(session, faction_id: str):
     data, status = await supabase_get(
         session,
@@ -846,9 +845,7 @@ async def get_faction_by_id(session, faction_id: str):
         return data[0]
     return None
 
-
 async def get_player_faction(session, mc_uuid: str):
-    # find faction_members row, then faction
     data, status = await supabase_get(
         session,
         "faction_members",
@@ -862,7 +859,6 @@ async def get_player_faction(session, mc_uuid: str):
     faction = await get_faction_by_id(session, faction_id)
     return faction, member_row
 
-
 async def get_faction_members(session, faction_id: str):
     data, status = await supabase_get(
         session,
@@ -872,7 +868,6 @@ async def get_faction_members(session, faction_id: str):
     if status == 200 and isinstance(data, list):
         return data
     return []
-
 
 async def update_faction_member_count(session, faction_id: str):
     members = await get_faction_members(session, faction_id)
@@ -885,9 +880,7 @@ async def update_faction_member_count(session, faction_id: str):
     )
     return count
 
-
 async def build_faction_status_embed(session):
-    # Build a global embed listing all factions and their members
     data, status = await supabase_get(
         session,
         "factions",
@@ -923,10 +916,9 @@ async def build_faction_status_embed(session):
 
     return embed
 
-
 async def refresh_faction_embed(session):
     if FACTION_EMBED_MESSAGE_ID == 0:
-        return  # not configured, silently skip
+        return
 
     channel = bot.get_channel(FACTION_STATUS_CHANNEL_ID)
     if channel is None:
@@ -944,12 +936,9 @@ async def refresh_faction_embed(session):
     except Exception as e:
         print("FACTION EMBED EDIT ERROR:", e)
 
-
 # ============================================================
 # DISCORD-SIDE FACTION COMMANDS
-# These mirror the Minecraft-side logic but operate via Supabase
 # ============================================================
-
 @tree.command(name="faction_create", description="Create a new faction (linked to your Minecraft UUID)")
 async def faction_create(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
@@ -968,21 +957,18 @@ async def faction_create(interaction: discord.Interaction, name: str):
 
             mc_uuid = acc["mc_uuid"]
 
-            # Check if player already in a faction
             existing_faction, _ = await get_player_faction(session, mc_uuid)
             if existing_faction:
                 return await interaction.followup.send("❌ You are already in a faction. Leave it first.")
 
-            # Check if faction name already exists
             existing_by_name = await get_faction_by_name(session, name)
             if existing_by_name:
                 return await interaction.followup.send("❌ A faction with that name already exists.")
 
-            # Create faction
             faction_data = {
                 "name": name,
                 "creator_uuid": mc_uuid,
-                "member_count": 0  # will be updated after adding member
+                "member_count": 0
             }
             created, status = await supabase_post(session, "factions", faction_data)
             if status != 201 or not isinstance(created, list) or not created:
@@ -992,7 +978,6 @@ async def faction_create(interaction: discord.Interaction, name: str):
             faction = created[0]
             faction_id = faction["id"]
 
-            # Add creator as first member
             member_data = {
                 "faction_id": faction_id,
                 "player_uuid": mc_uuid
@@ -1004,10 +989,7 @@ async def faction_create(interaction: discord.Interaction, name: str):
                     "❌ Faction created but failed to add you as a member. Contact an admin."
                 )
 
-            # Update member count
             count = await update_faction_member_count(session, faction_id)
-
-            # Refresh Discord embed
             await refresh_faction_embed(session)
 
             await interaction.followup.send(
@@ -1018,7 +1000,6 @@ async def faction_create(interaction: discord.Interaction, name: str):
     except Exception as e:
         print("FACTION_CREATE ERROR:", e)
         await interaction.followup.send("❌ Internal error while creating faction.")
-
 
 @tree.command(name="faction_join", description="Join an existing faction (by name)")
 async def faction_join(interaction: discord.Interaction, name: str):
@@ -1036,7 +1017,6 @@ async def faction_join(interaction: discord.Interaction, name: str):
 
             mc_uuid = acc["mc_uuid"]
 
-            # Check if already in a faction
             existing_faction, _ = await get_player_faction(session, mc_uuid)
             if existing_faction:
                 return await interaction.followup.send("❌ You are already in a faction. Leave it first.")
@@ -1067,7 +1047,6 @@ async def faction_join(interaction: discord.Interaction, name: str):
     except Exception as e:
         print("FACTION_JOIN ERROR:", e)
         await interaction.followup.send("❌ Internal error while joining faction.")
-
 
 @tree.command(name="faction_details", description="Show details about your current faction")
 async def faction_details(interaction: discord.Interaction):
@@ -1121,7 +1100,6 @@ async def faction_details(interaction: discord.Interaction):
         print("FACTION_DETAILS ERROR:", e)
         await interaction.followup.send("❌ Internal error while loading faction details.")
 
-
 @tree.command(name="faction_leave", description="Leave your current faction")
 async def faction_leave(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
@@ -1142,13 +1120,11 @@ async def faction_leave(interaction: discord.Interaction):
 
             faction_id = faction["id"]
 
-            # Prevent leader from leaving without disbanding
             if faction["creator_uuid"] == mc_uuid:
                 return await interaction.followup.send(
                     "❌ You are the faction leader. Use `/faction_disband` instead."
                 )
 
-            # Remove membership
             _, status = await supabase_delete(
                 session,
                 "faction_members",
@@ -1168,7 +1144,6 @@ async def faction_leave(interaction: discord.Interaction):
     except Exception as e:
         print("FACTION_LEAVE ERROR:", e)
         await interaction.followup.send("❌ Internal error while leaving faction.")
-
 
 @tree.command(name="faction_disband", description="Disband your faction (leader only)")
 async def faction_disband(interaction: discord.Interaction):
@@ -1193,7 +1168,6 @@ async def faction_disband(interaction: discord.Interaction):
 
             faction_id = faction["id"]
 
-            # Delete all members first (ON DELETE CASCADE could also handle this)
             _, m_status = await supabase_delete(
                 session,
                 "faction_members",
@@ -1202,7 +1176,6 @@ async def faction_disband(interaction: discord.Interaction):
             if m_status not in (200, 204):
                 print("FACTION DISBAND MEMBER DELETE ERROR:", m_status)
 
-            # Delete faction
             _, f_status = await supabase_delete(
                 session,
                 "factions",
@@ -1221,7 +1194,6 @@ async def faction_disband(interaction: discord.Interaction):
         print("FACTION_DISBAND ERROR:", e)
         await interaction.followup.send("❌ Internal error while disbanding faction.")
 
-
 # ============================================================
 # BOT STARTUP EVENT
 # ============================================================
@@ -1234,37 +1206,45 @@ async def on_ready():
     except Exception as e:
         print("COMMAND SYNC ERROR:", e)
 
-    # Optional: refresh faction embed on startup
     try:
         async with aiohttp.ClientSession() as session:
             await refresh_faction_embed(session)
     except Exception as e:
         print("FACTION EMBED STARTUP REFRESH ERROR:", e)
 
-
 # -------------------------------
 # FASTAPI + DISCORD BOT RUNNER
 # -------------------------------
-import uvicorn
-from fastapi import FastAPI
-import asyncio
-
 app = FastAPI()
 
-@app.get("/refresh")
-async def refresh():
+@app.post("/refresh")
+async def refresh(request: Request):
     print("Minecraft triggered refresh")
+
+    data = await request.json()
+    event_type = data.get("event", "unknown_event")
+
     await bot.wait_until_ready()
-    await send_faction_update()
+    await send_mc_event_embed(event_type)
+
     return {"status": "ok"}
 
-async def send_faction_update():
-    channel = bot.get_channel(FACTION_CHANNEL_ID)
-    print("Channel:", channel)  # Debug
+async def send_mc_event_embed(event_type: str):
+    channel = bot.get_channel(MC_EVENT_CHANNEL)
+    print("MC Event Channel:", channel)
     if channel is None:
-        print("Faction channel not found!")
+        print("MC event channel not found!")
         return
-    await channel.send("A faction event occurred! (Created/Joined/Left/War/etc)")
+
+    embed = discord.Embed(
+        title="📣 Minecraft Faction Event",
+        description=f"Event: **{event_type}**",
+        color=discord.Color.blue()
+    )
+    year = datetime.utcnow().year
+    embed.add_field(name="Year", value=str(year), inline=False)
+
+    await channel.send(embed=embed)
 
 async def start_fastapi():
     port = int(os.environ.get("PORT", 8000))
