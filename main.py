@@ -1212,56 +1212,49 @@ async def on_ready():
     except Exception as e:
         print("FACTION EMBED STARTUP REFRESH ERROR:", e)
 
+import os
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
 # -------------------------------
-# FASTAPI + DISCORD BOT RUNNER
+# BOT STARTUP
 # -------------------------------
-app = FastAPI()
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-@app.post("/refresh")
-async def refresh(request: Request):
-    print("Minecraft triggered refresh")
+    try:
+        synced = await tree.sync()
+        print(f"Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print("Slash command sync error:", e)
 
-    data = await request.json()
-    event_type = data.get("event", "unknown_event")
+# -------------------------------
+# TEST COMMAND
+# -------------------------------
+@tree.command(name="ping", description="Test command")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
 
-    await bot.wait_until_ready()
-    await send_mc_event_embed(event_type)
+# -------------------------------
+# EXAMPLE COMMAND
+# -------------------------------
+@tree.command(name="hello", description="Say hello")
+async def hello(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Hello {interaction.user.mention}!")
 
-    return {"status": "ok"}
-
-async def send_mc_event_embed(event_type: str):
-    channel = bot.get_channel(MC_EVENT_CHANNEL)
-    print("MC Event Channel:", channel)
-    if channel is None:
-        print("MC event channel not found!")
-        return
-
-    embed = discord.Embed(
-        title="📣 Minecraft Faction Event",
-        description=f"Event: **{event_type}**",
-        color=discord.Color.blue()
-    )
-    year = datetime.utcnow().year
-    embed.add_field(name="Year", value=str(year), inline=False)
-
-    await channel.send(embed=embed)
-
-async def start_fastapi():
-    port = int(os.environ.get("PORT", 8000))
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
-
-async def main():
-    await asyncio.gather(
-        bot.start(DISCORD_TOKEN),
-        start_fastapi()
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# -------------------------------
+# RUN BOT
+# -------------------------------
+bot.run(DISCORD_TOKEN)
